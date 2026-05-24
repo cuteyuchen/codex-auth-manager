@@ -1,8 +1,9 @@
 import cron, {type ScheduledTask} from "node-cron";
-import {checkAccount, listAccounts, mapWithConcurrency, resolveDefaultConcurrency} from "./auth-service.js";
+import {checkAccount, listAccounts, mapWithConcurrency, pushAccountToBoundPlatforms, resolveDefaultConcurrency} from "./auth-service.js";
 import {getSettings, upsertSetting} from "./db.js";
 import {addJobEvent, createJob, runJob} from "./job-service.js";
 import {reauthorizeAccount} from "./registration-service.js";
+import {syncPlatformCredentials} from "./credential-sync-service.js";
 
 let task: ScheduledTask | null = null;
 
@@ -52,6 +53,9 @@ export function startScheduler(): void {
 export async function runScheduledRefresh(): Promise<void> {
   const job = createJob("scheduled_refresh", "定时刷新凭据状态");
   await runJob(job.id, async () => {
+    addJobEvent(job.id, "info", "开始同步平台凭据");
+    const syncResult = await syncPlatformCredentials({source: "all", checkAfterSync: false, jobId: job.id});
+    addJobEvent(job.id, syncResult.failed ? "warn" : "success", `平台同步完成：新增 ${syncResult.imported}，更新 ${syncResult.updated}，跳过 ${syncResult.skipped}，失败 ${syncResult.failed}`);
     const accounts = listAccounts();
     addJobEvent(job.id, "info", `准备检查 ${accounts.length} 个账号`);
     const concurrency = resolveDefaultConcurrency(accounts.length);
@@ -61,6 +65,12 @@ export async function runScheduledRefresh(): Promise<void> {
         if (!summary.ok && account.auto_reauth) {
           addJobEvent(job.id, "warn", `${account.email} refresh/check 失败，尝试重新登录授权`);
           await reauthorizeAccount(account.id, job.id);
+          try {
+            await pushAccountToBoundPlatforms(account.id);
+            addJobEvent(job.id, "success", `${account.email} 重新授权后已同步到绑定平台`);
+          } catch (error) {
+            addJobEvent(job.id, "error", `${account.email} 重新授权后同步绑定平台失败: ${error instanceof Error ? error.message : String(error)}`);
+          }
           return {email: account.email, status: "reauthorized"};
         }
         return {email: account.email, status: summary.status};

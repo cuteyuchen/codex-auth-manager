@@ -1,6 +1,7 @@
 {
   "name": "codex-auth-manager",
   "version": "1.0.7",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {

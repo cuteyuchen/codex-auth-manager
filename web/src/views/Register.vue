@@ -241,7 +241,7 @@ onBeforeUnmount(() => source?.close());
           </template>
 
           <template v-else>
-            <el-alert title="自定义来源只在本次 Web 注册任务内临时使用，不会写回全局配置；字段沿用 CLI provider 语义。" type="info" show-icon class="mb-3" />
+            <el-alert title="自定义来源只在本次 Web 注册任务内临时使用，不会写回全局配置；字段沿用邮箱 provider 语义。" type="info" show-icon class="mb-3" />
             <el-row :gutter="12">
               <el-col :xs="24" :sm="12">
                 <el-form-item label="邮箱 provider">

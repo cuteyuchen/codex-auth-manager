@@ -39,6 +39,7 @@ export interface PushServiceConfig {
   secret: string;
   includeProxyUrl: boolean;
   options: Record<string, unknown>;
+  priority: number;
   fallback: boolean;
 }
 
@@ -133,6 +134,7 @@ async function rowToPushConfig(row: IntegrationServiceRow): Promise<PushServiceC
     secret: await decryptSecret(row.secret_encrypted),
     includeProxyUrl: Boolean(row.include_proxy_url),
     options: parseOptions(row.options_json),
+    priority: row.priority,
     fallback: false,
   };
 }
@@ -306,7 +308,7 @@ export async function resolvePushServices(kind: IntegrationServiceKind, ids?: nu
     const baseUrl = normalizeBaseUrl(appConfig.cliproxyApiBaseUrl);
     const secret = String(appConfig.cliproxyApiManagementKey ?? "").trim();
     return baseUrl && secret
-      ? [{kind, name: "全局 CPA 配置", baseUrl, secret, includeProxyUrl: false, options: {}, fallback: true}]
+      ? [{kind, name: "全局 CPA 配置", baseUrl, secret, includeProxyUrl: false, options: {}, priority: 9999, fallback: true}]
       : [];
   }
 
@@ -320,6 +322,7 @@ export async function resolvePushServices(kind: IntegrationServiceKind, ids?: nu
       secret,
       includeProxyUrl: false,
       options: buildSub2APIFallbackOptions(),
+      priority: 9999,
       fallback: true,
     }]
     : [];

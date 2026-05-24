@@ -6,7 +6,7 @@
 
 `codex-auth-manager` 当前是本地 Web 管理台，用于管理 ChatGPT / Codex 注册授权链路、邮箱池、账号凭据、额度检查、任务日志、HeroSMS 接码，以及 CPA / Sub2API 推送。
 
-项目不再以 CLI 为主要形态，也不再读取或写入 `config.json`。配置唯一真源是 SQLite `app_settings`，通过 Web 配置页维护。
+配置唯一真源是 SQLite `app_settings`，通过 Web 配置页维护。
 
 ## 常用命令
 
@@ -16,14 +16,11 @@
 - `npm run web`：运行构建后的本地管理台。
 - `npx tsc --noEmit --pretty false`：类型检查。
 
-当前 `package.json` 只保留 Web 管理台相关脚本。不要恢复 `dev`、`start`、`check`、`check:cpa`、`batch` 等旧 CLI scripts。
-
 ## 目录结构
 
 - `web/`：Vue 3 + Vite + Element Plus + TailwindCSS 前端。
 - `src/backend/`：Fastify API、SQLite、配置、账号、任务、邮箱、调度、HeroSMS 服务。
 - `src/core/`：OpenAI 注册授权核心、邮箱 provider、SMS provider、CPA/Sub2API 客户端、sentinel、设备指纹。
-- `src/legacy-cli/`：旧 CLI 源码参考，不进入当前打包入口。
 - `bundle/`：后端构建产物，当前只应生成 `server.cjs`。
 - `web/dist/`：前端构建产物。
 - `data/`：SQLite 和本地密钥，gitignored。
@@ -59,8 +56,6 @@ http://127.0.0.1:3789/
 
 注意：
 
-- 不要新增 `config.json` 读取、写入或迁移逻辑。
-- 不要要求用户复制 `config.example.json`。
 - UI 保存配置后应调用配置服务刷新内存快照，让新任务立即使用最新配置。
 - API 返回敏感字段时只能返回 `hasValue`、`tail` 等掩码信息。
 

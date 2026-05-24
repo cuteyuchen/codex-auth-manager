@@ -29,6 +29,11 @@ export interface AccountRow {
     status_code?: string | null;
     status_label?: string | null;
     credential_type?: string | null;
+    credential_source_kind?: string | null;
+    credential_source_name?: string | null;
+    credential_source_service_id?: number | null;
+    credential_source_remote_id?: string | null;
+    credential_synced_at?: string | null;
 }
 
 export interface AuthFileRow {
@@ -48,6 +53,11 @@ export interface AuthFileRow {
     current_step?: string | null;
     step_status?: string | null;
     last_step_at?: string | null;
+    credential_source_kind?: string | null;
+    credential_source_name?: string | null;
+    credential_source_service_id?: number | null;
+    credential_source_remote_id?: string | null;
+    credential_synced_at?: string | null;
 }
 
 export interface AccountUsageWindowRow {
@@ -150,6 +160,28 @@ export interface IntegrationServiceRow {
     last_test_message: string | null;
     created_at: string;
     updated_at: string;
+}
+
+export interface AccountPlatformBindingRow {
+    id: number;
+    account_id: number;
+    integration_service_id: number;
+    last_push_at: string | null;
+    last_push_status: string | null;
+    last_push_message: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface CredentialSyncEventRow {
+    id: number;
+    account_id: number | null;
+    integration_service_id: number | null;
+    source_kind: IntegrationServiceKind | "local";
+    action: string;
+    status: string;
+    message: string | null;
+    created_at: string;
 }
 
 let db: Database.Database | null = null;
@@ -264,10 +296,20 @@ function migrate(database: Database.Database): void {
   addColumnIfMissing(database, "accounts", "status_code", "TEXT");
   addColumnIfMissing(database, "accounts", "status_label", "TEXT");
   addColumnIfMissing(database, "accounts", "credential_type", "TEXT");
+  addColumnIfMissing(database, "accounts", "credential_source_kind", "TEXT");
+  addColumnIfMissing(database, "accounts", "credential_source_name", "TEXT");
+  addColumnIfMissing(database, "accounts", "credential_source_service_id", "INTEGER");
+  addColumnIfMissing(database, "accounts", "credential_source_remote_id", "TEXT");
+  addColumnIfMissing(database, "accounts", "credential_synced_at", "TEXT");
   addColumnIfMissing(database, "auth_files", "credential_type", "TEXT NOT NULL DEFAULT 'codex_auth'");
   addColumnIfMissing(database, "auth_files", "current_step", "TEXT");
   addColumnIfMissing(database, "auth_files", "step_status", "TEXT");
   addColumnIfMissing(database, "auth_files", "last_step_at", "TEXT");
+  addColumnIfMissing(database, "auth_files", "credential_source_kind", "TEXT");
+  addColumnIfMissing(database, "auth_files", "credential_source_name", "TEXT");
+  addColumnIfMissing(database, "auth_files", "credential_source_service_id", "INTEGER");
+  addColumnIfMissing(database, "auth_files", "credential_source_remote_id", "TEXT");
+  addColumnIfMissing(database, "auth_files", "credential_synced_at", "TEXT");
 
   database.exec(`
         CREATE TABLE IF NOT EXISTS mail_types (
@@ -370,6 +412,34 @@ function migrate(database: Database.Database): void {
         );
 
         CREATE INDEX IF NOT EXISTS idx_integration_services_kind ON integration_services(kind, enabled, priority);
+
+        CREATE TABLE IF NOT EXISTS account_platform_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            integration_service_id INTEGER NOT NULL REFERENCES integration_services(id) ON DELETE CASCADE,
+            last_push_at TEXT,
+            last_push_status TEXT,
+            last_push_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(account_id, integration_service_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS credential_sync_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+            integration_service_id INTEGER REFERENCES integration_services(id) ON DELETE SET NULL,
+            source_kind TEXT NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_account_platform_bindings_account ON account_platform_bindings(account_id);
+        CREATE INDEX IF NOT EXISTS idx_account_platform_bindings_service ON account_platform_bindings(integration_service_id);
+        CREATE INDEX IF NOT EXISTS idx_credential_sync_events_account ON credential_sync_events(account_id, id);
+        CREATE INDEX IF NOT EXISTS idx_credential_sync_events_service ON credential_sync_events(integration_service_id, id);
     `);
 
   addColumnIfMissing(database, "mail_sources", "mail_type_id", "INTEGER REFERENCES mail_types(id) ON DELETE SET NULL");
@@ -497,6 +567,7 @@ export function getDatabaseStats(): {
     jobs: number;
     jobEvents: number;
     integrationServices: number;
+    accountPlatformBindings: number;
 } {
   const database = getDb();
   const count = (table: string) => {
@@ -514,5 +585,6 @@ export function getDatabaseStats(): {
     jobs: count("jobs"),
     jobEvents: count("job_events"),
     integrationServices: count("integration_services"),
+    accountPlatformBindings: count("account_platform_bindings"),
   };
 }

@@ -16,6 +16,7 @@ const HOTMAIL_OAUTH_TOKEN_URL = "https://login.microsoftonline.com/consumers/oau
 const HOTMAIL_DEFAULT_REDIRECT_URI = "http://localhost:8787/callback";
 const HOTMAIL_REST_READ_SCOPE = "https://outlook.office.com/Mail.Read offline_access";
 const HOTMAIL_GRAPH_READ_SCOPE = "openid profile offline_access User.Read Mail.Read";
+const HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE = "openid profile offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.Read";
 const HOTMAIL_LEGACY_SCOPE = "openid profile User.Read Mail.ReadWrite Mail.Send Mail.Read";
 const HOTMAIL_POLL_ATTEMPTS = 12;
 const HOTMAIL_POLL_INTERVAL_MS = 5000;
@@ -24,15 +25,48 @@ const HOTMAIL_FOLDER_IDS = ["inbox", "junkemail"];
 const aliasAccountMap = new Map();
 let accountCache = null;
 
+function normalizeApiMode(value) {
+  const mode = String(value ?? "").toLowerCase();
+  return mode === "rest" || mode === "graph" ? mode : "";
+}
+
+function normalizeScope(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function isRestScope(value) {
+  const scope = normalizeScope(value);
+  return scope.includes("outlook.office.com/");
+}
+
+function isGraphScope(value) {
+  const scope = normalizeScope(value);
+  if (scope.includes("outlook.office.com/")) {
+    return false;
+  }
+  return scope.includes("graph.microsoft.com/")
+    || /\buser\.read\b/i.test(scope)
+    || /\bmail\.read(?:write)?\b/i.test(scope)
+    || /\bmail\.send\b/i.test(scope);
+}
+
 function normalizeEmail(value) {
   return String(value ?? "").trim().toLowerCase();
 }
 
 function resolveApiMode(account) {
-  const scope = String(account?.scope ?? "").toLowerCase();
+  const explicitMode = normalizeApiMode(account?.apiMode);
+  if (explicitMode) {
+    return explicitMode;
+  }
+
+  const scope = normalizeScope(account?.scope);
   const accessToken = String(account?.accessToken ?? "").trim();
-  if (accessToken && !isCompactToken(accessToken)) {
+  if (isRestScope(scope)) {
     return "rest";
+  }
+  if (isGraphScope(scope)) {
+    return "graph";
   }
 
   const payload = decodeJwtPayload(accessToken);
@@ -46,15 +80,7 @@ function resolveApiMode(account) {
     return "graph";
   }
 
-  if (scope.includes("outlook.office.com")) {
-    return "rest";
-  }
-  if (scope.includes("graph.microsoft.com") || /\buser\.read\b|\bmail\.read\b/i.test(scope)) {
-    return "graph";
-  }
-
-  const explicitMode = String(account?.apiMode ?? "").toLowerCase();
-  return explicitMode === "rest" || explicitMode === "graph" ? explicitMode : "graph";
+  return "graph";
 }
 
 function decodeJwtPayload(token) {
@@ -132,6 +158,7 @@ export function buildHotmailTokenAccount({
   redirectUri = "",
   index = -1,
   lineRaw = "",
+  apiMode = "",
   raw = {},
   fileName = path.basename(HOTMAIL_TOKENS_FILE),
   filePath = HOTMAIL_TOKENS_FILE,
@@ -158,6 +185,7 @@ export function buildHotmailTokenAccount({
     obtainedAt: "",
     expiresIn: 0,
     extExpiresIn: 0,
+    apiMode: normalizeApiMode(apiMode),
     raw,
     persist,
   };
@@ -206,6 +234,7 @@ async function nextHotmailEmailFromQueue(label) {
           password: entry.password,
           clientId: entry.clientId,
           refreshToken: entry.refreshToken,
+          apiMode: "graph",
           index: entry.lineIndex,
           lineRaw: entry.lineRaw,
         })
@@ -259,19 +288,26 @@ async function persistAccount(account) {
 function buildRefreshVariants(account) {
   const redirectUri = String(account.redirectUri ?? "").trim();
   const scope = String(account.scope ?? "").trim();
-  const variants = [
-    {redirectUri: "", scope: ""},
-    {redirectUri, scope: ""},
-    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: ""},
-    {redirectUri, scope},
+  const apiMode = resolveApiMode(account);
+  const variants = apiMode === "rest" ? [
     {redirectUri: "", scope: HOTMAIL_REST_READ_SCOPE},
     {redirectUri, scope: HOTMAIL_REST_READ_SCOPE},
     {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_REST_READ_SCOPE},
+    ...(isRestScope(scope) ? [{redirectUri, scope}] : []),
+    {redirectUri: "", scope: ""},
+    {redirectUri, scope: ""},
+    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: ""},
+  ] : [
     {redirectUri: "", scope: HOTMAIL_GRAPH_READ_SCOPE},
     {redirectUri, scope: HOTMAIL_GRAPH_READ_SCOPE},
     {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_GRAPH_READ_SCOPE},
+    {redirectUri: "", scope: HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE},
+    {redirectUri, scope: HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE},
+    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE},
+    {redirectUri: "", scope: HOTMAIL_LEGACY_SCOPE},
     {redirectUri, scope: HOTMAIL_LEGACY_SCOPE},
     {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_LEGACY_SCOPE},
+    ...(isGraphScope(scope) ? [{redirectUri, scope}] : []),
   ];
   const seen = new Set();
 
@@ -339,7 +375,7 @@ async function refreshAccessToken(account) {
     account.expiresIn = Number(payload?.expires_in ?? account.expiresIn ?? 0);
     account.extExpiresIn = Number(payload?.ext_expires_in ?? account.extExpiresIn ?? 0);
     account.obtainedAt = new Date().toISOString();
-    account.apiMode = resolveApiMode(account);
+    account.apiMode = normalizeApiMode(account.apiMode) || resolveApiMode(account);
 
     await persistAccount(account);
     console.log(`hotmailTokenRefreshed: ${account.loginHint} mode=${account.apiMode} scope=${account.scope}`);
@@ -417,7 +453,12 @@ async function listFolderMessages(account, folderId) {
     }
 
     if (!response.ok) {
-      throw new Error(`Hotmail ${isRest ? "REST" : "Graph"} 请求失败: ${response.status} body=${await response.text()}`);
+      const rawBody = await response.text();
+      const bodyText = rawBody || "(empty)";
+      const hint = response.status === 401
+        ? "，已刷新 token 后仍被拒绝，请确认 refresh_token 对应的 Microsoft Graph Mail.Read 权限仍有效"
+        : "";
+      throw new Error(`Hotmail ${isRest ? "REST" : "Graph"} 请求失败: ${response.status}${hint} body=${bodyText}`);
     }
 
     payload = await response.json();

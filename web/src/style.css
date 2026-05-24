@@ -188,10 +188,10 @@ button,
 }
 
 .table-actions {
-    display: inline-flex;
-    align-items: center;
+    /*display: inline-flex;*/
+    /*align-items: center;*/
     gap: 6px;
-    white-space: nowrap;
+    /*white-space: nowrap;*/
 }
 
 .table-actions .el-button {

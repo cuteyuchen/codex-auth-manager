@@ -14,6 +14,9 @@ const heroError = ref("");
 const heroPriceError = ref("");
 const heroBalanceError = ref("");
 const loadingHero = ref(false);
+const loadingHeroPrices = ref(false);
+const heroService = ref("dr");
+let heroServiceRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 const testingProxy = ref(false);
 const proxyTestResult = ref<{
   ok: boolean;
@@ -54,6 +57,24 @@ const legacyPushConfigKeys = new Set([
 ]);
 
 const selectedHeroPrice = computed(() => heroPrices.value[0]);
+const selectedHeroCountry = computed(() => heroCountries.value.find((country) => String(country.countryId) === String(config.heroSMSCountry)) ?? null);
+const heroPriceStatus = computed(() => {
+  const price = selectedHeroPrice.value?.price;
+  const maxPrice = Number(config.heroSMSMaxPrice);
+  if (typeof price !== "number" || !Number.isFinite(price) || !Number.isFinite(maxPrice) || maxPrice <= 0) {
+    return null;
+  }
+  if (price > maxPrice) {
+    return {
+      type: "warning" as const,
+      title: `当前价格 ${formatPrice(selectedHeroPrice.value)} 高于最高价格 ${maxPrice}`,
+    };
+  }
+  return {
+    type: "success" as const,
+    title: `当前价格 ${formatPrice(selectedHeroPrice.value)} 未超过最高价格 ${maxPrice}`,
+  };
+});
 
 function heroCountryLabel(country: HeroSmsCountry) {
   const primary = country.countryName || country.countryNameEn || country.countryNameRu || `国家 ID: ${country.countryId}`;
@@ -166,13 +187,25 @@ async function loadHeroPrices() {
   if (!config.heroSMSCountry) {
     return;
   }
+  loadingHeroPrices.value = true;
   try {
-    const payload = await apiGet<{prices: HeroSmsPrice[]; error?: string}>(`/api/hero-sms/prices?country=${encodeURIComponent(config.heroSMSCountry)}&service=dr`);
+    const service = heroService.value.trim() || "dr";
+    const payload = await apiGet<{prices: HeroSmsPrice[]; error?: string}>(`/api/hero-sms/prices?country=${encodeURIComponent(config.heroSMSCountry)}&service=${encodeURIComponent(service)}`);
     heroPrices.value = payload.prices;
     heroPriceError.value = payload.error || "";
   } catch (error) {
     heroPriceError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    loadingHeroPrices.value = false;
   }
+}
+
+async function refreshHeroSms() {
+  await Promise.all([
+    loadHeroCountries(),
+    loadHeroBalance(),
+    loadHeroPrices(),
+  ]);
 }
 
 function formatBalance(value: HeroSmsBalance | null) {
@@ -182,8 +215,31 @@ function formatBalance(value: HeroSmsBalance | null) {
   return `${value.balance.toFixed(4)}${value.currency ? ` ${value.currency}` : ""}`;
 }
 
+function formatPrice(value: HeroSmsPrice | null | undefined) {
+  if (!value || typeof value.price !== "number") {
+    return "未返回";
+  }
+  return `${value.price.toFixed(4)}${value.currency ? ` ${value.currency}` : ""}`;
+}
+
+function formatAvailable(value: HeroSmsPrice | null | undefined) {
+  if (!value || typeof value.available !== "number") {
+    return "未返回";
+  }
+  return String(value.available);
+}
+
 watch(() => config.heroSMSCountry, () => {
   void loadHeroPrices();
+});
+
+watch(heroService, () => {
+  if (heroServiceRefreshTimer) {
+    clearTimeout(heroServiceRefreshTimer);
+  }
+  heroServiceRefreshTimer = setTimeout(() => {
+    void loadHeroPrices();
+  }, 300);
 });
 
 onMounted(load);
@@ -256,7 +312,7 @@ onMounted(load);
           <template #header>
             <div class="flex items-center justify-between">
               <span>HeroSMS</span>
-              <el-button :icon="Refresh" :loading="loadingHero" size="small" @click="() => { void loadHeroCountries(); void loadHeroBalance(); }">刷新</el-button>
+              <el-button :icon="Refresh" :loading="loadingHero || loadingHeroPrices" size="small" @click="refreshHeroSms">刷新</el-button>
             </div>
           </template>
           <el-form label-position="top" :model="config">
@@ -293,21 +349,87 @@ onMounted(load);
               <div v-if="heroError" class="mt-2 text-sm text-amber-600">{{ heroError }}</div>
             </el-form-item>
             <el-row :gutter="12">
-              <el-col :span="12">
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="服务代码">
+                  <el-input
+                    v-model="heroService"
+                    placeholder="dr"
+                    clearable
+                    @keyup.enter="loadHeroPrices"
+                  >
+                    <template #append>
+                      <el-button :icon="Refresh" :loading="loadingHeroPrices" @click="loadHeroPrices">价格</el-button>
+                    </template>
+                  </el-input>
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="当前查询">
+                  <div class="flex min-h-8 w-full flex-wrap items-center gap-2 rounded-md border border-[var(--el-border-color)] px-3 py-1.5 text-sm">
+                    <el-tag size="small" effect="plain">{{ selectedHeroCountry?.countryName || selectedHeroCountry?.countryNameEn || config.heroSMSCountry || "未选择国家" }}</el-tag>
+                    <el-tag size="small" type="info" effect="plain">服务 {{ heroService.trim() || "dr" }}</el-tag>
+                  </div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="12">
+              <el-col :xs="24" :sm="12">
                 <el-form-item label="最高价格"><el-input-number v-model="config.heroSMSMaxPrice" :step="0.01" :min="0" class="w-full" /></el-form-item>
               </el-col>
-              <el-col :span="12">
+              <el-col :xs="24" :sm="12">
                 <el-form-item label="轮询次数"><el-input-number v-model="config.heroSMSPollAttempts" :min="1" class="w-full" /></el-form-item>
               </el-col>
             </el-row>
             <el-form-item label="轮询间隔 ms"><el-input-number v-model="config.heroSMSPollIntervalMs" :min="1000" class="w-full" /></el-form-item>
+            <div class="rounded-lg border border-[var(--el-border-color-light)]">
+              <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--el-border-color-light)] px-3 py-2">
+                <div>
+                  <div class="text-sm font-medium text-[var(--el-text-color-primary)]">当前价格与号码数量</div>
+                  <div class="text-xs text-[var(--el-text-color-secondary)]">来自 HeroSMS getPrices，按国家和服务返回。</div>
+                </div>
+                <el-button :icon="Refresh" :loading="loadingHeroPrices" size="small" @click="loadHeroPrices">刷新价格</el-button>
+              </div>
+              <el-table
+                v-if="heroPrices.length > 0"
+                :data="heroPrices"
+                size="small"
+                class="w-full"
+              >
+                <el-table-column label="国家" min-width="140">
+                  <template #default="{row}">
+                    <div class="font-medium">{{ row.countryName || selectedHeroCountry?.countryName || row.countryId }}</div>
+                    <div class="text-xs text-[var(--el-text-color-secondary)]">
+                      ID {{ row.countryId }}<span v-if="row.phoneCode || selectedHeroCountry?.phoneCode"> · +{{ row.phoneCode || selectedHeroCountry?.phoneCode }}</span>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="服务" min-width="90">
+                  <template #default="{row}">
+                    <el-tag size="small" effect="plain">{{ row.service || heroService.trim() || "dr" }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="当前价格" min-width="110">
+                  <template #default="{row}">
+                    <span class="tabular-nums">{{ formatPrice(row) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="可用号码" min-width="100">
+                  <template #default="{row}">
+                    <span class="tabular-nums">{{ formatAvailable(row) }}</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <div v-else class="px-3 py-4 text-sm text-amber-600">
+                {{ heroPriceError || (config.heroSMSCountry ? "价格接口未返回" : "请选择国家后查询价格") }}
+              </div>
+            </div>
             <el-alert
-              v-if="selectedHeroPrice"
-              :title="`OpenAI(dr) 当前价格：${selectedHeroPrice.price ?? '未返回'}${selectedHeroPrice.currency ? ' ' + selectedHeroPrice.currency : ''}，可用数量：${selectedHeroPrice.available ?? '未返回'}`"
-              type="success"
+              v-if="heroPriceStatus"
+              class="mt-3"
+              :title="heroPriceStatus.title"
+              :type="heroPriceStatus.type"
               show-icon
             />
-            <el-alert v-else :title="heroPriceError || '价格接口未返回'" type="warning" show-icon />
           </el-form>
         </el-card>
       </el-col>

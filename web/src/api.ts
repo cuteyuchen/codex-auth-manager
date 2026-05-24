@@ -55,6 +55,17 @@ export interface Account {
     status_code: string | null;
     status_label: string | null;
     credential_type: string | null;
+    credential_source_kind: string | null;
+    credential_source_name: string | null;
+    credential_source_service_id: number | null;
+    credential_source_remote_id: string | null;
+    credential_synced_at: string | null;
+    source_id: number | null;
+    source_name: string | null;
+    source_provider: string | null;
+    source_vendor: string | null;
+    source_batch_note: string | null;
+    mailbox_id: number | null;
     plan: string | null;
     remaining_percent: number | null;
     used_percent: number | null;
@@ -64,6 +75,7 @@ export interface Account {
     last_auth_at: string | null;
     last_error: string | null;
     auto_reauth: number;
+    has_password: boolean;
     created_at: string;
     updated_at: string;
     auth_file_path: string | null;
@@ -73,6 +85,7 @@ export interface Account {
     step_status: string | null;
     last_step_at: string | null;
     usage_windows: UsageWindow[];
+    platform_bindings: BoundPlatformService[];
 }
 
 export interface Job {
@@ -217,6 +230,17 @@ export interface IntegrationService {
   lastTestMessage: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface BoundPlatformService {
+  id: number;
+  kind: IntegrationServiceKind;
+  name: string;
+  priority: number;
+  enabled: boolean;
+  lastPushAt: string | null;
+  lastPushStatus: string | null;
+  lastPushMessage: string | null;
 }
 
 export interface SessionState {

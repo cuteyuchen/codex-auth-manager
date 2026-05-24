@@ -260,6 +260,7 @@ async function createMailboxProvider(type: Pick<MailTypeRow, "provider" | "subty
     refreshToken,
     accessToken,
     scope: "",
+    apiMode: "graph",
     fileName: `mailbox:${mailbox.id}`,
     filePath: "database",
     raw: {source: "database-mailbox", mailboxId: mailbox.id},

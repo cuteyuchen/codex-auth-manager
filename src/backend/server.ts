@@ -12,9 +12,10 @@ import {
   listAccounts,
   mapWithConcurrency,
   pushAccount,
+  pushAccountToBoundPlatforms,
   readAccountAuthFile,
   resolveDefaultConcurrency,
-  setAccountPassword,
+  updateAccountProfile,
   type PushTarget,
 } from "./auth-service.js";
 import {getSchedulerConfig, startScheduler, updateSchedulerConfig} from "./scheduler.js";
@@ -61,6 +62,13 @@ import {
   testIntegrationService,
   updateIntegrationService,
 } from "./integration-service.js";
+import {
+  bulkSetAccountPlatformBindings,
+  listAccountPlatformBindings,
+  setAccountPlatformBindings,
+  type BindingMode,
+} from "./account-platform-binding-service.js";
+import {syncPlatformCredentials, type CredentialSyncSource} from "./credential-sync-service.js";
 import {backupDatabase, cleanupJobs, getSystemDatabaseInfo} from "./system-service.js";
 import {
   assertHostAccessAllowed,
@@ -177,6 +185,25 @@ app.get("/api/accounts", async (request) => {
 
 app.post("/api/accounts/import-auth", async () => importAuthFiles());
 
+app.post("/api/accounts/sync-platforms", async (request) => {
+  const body = request.body as {source?: CredentialSyncSource; serviceIds?: number[]; checkAfterSync?: boolean} | undefined;
+  const source = body?.source === "cpa" || body?.source === "sub2api" || body?.source === "all" ? body.source : "all";
+  const job = createJob("sync_platform_credentials", "同步平台凭据", {
+    source,
+    serviceIds: body?.serviceIds,
+    checkAfterSync: Boolean(body?.checkAfterSync),
+  });
+  void runJob(job.id, async () => ({
+    result: await syncPlatformCredentials({
+      source,
+      serviceIds: body?.serviceIds,
+      checkAfterSync: Boolean(body?.checkAfterSync),
+      jobId: job.id,
+    }),
+  }));
+  return {job};
+});
+
 app.get("/api/accounts/:id/auth-file", async (request, reply) => {
   const id = Number((request.params as {id: string}).id);
   const auth = await readAccountAuthFile(id);
@@ -196,11 +223,15 @@ app.post("/api/accounts/export-auth", async (request, reply) => {
     .send(archive.content);
 });
 
-app.put("/api/accounts/:id/password", async (request) => {
+app.put("/api/accounts/:id/profile", async (request) => {
   const id = Number((request.params as {id: string}).id);
-  const body = request.body as {password?: string};
-  await setAccountPassword(id, body.password ?? "");
-  return {ok: true};
+  const body = request.body as {password?: unknown; sourceId?: unknown} | undefined;
+  return {
+    account: await updateAccountProfile(id, {
+      password: typeof body?.password === "string" ? body.password : undefined,
+      sourceId: body && Object.hasOwn(body, "sourceId") ? (body.sourceId ? Number(body.sourceId) : null) : undefined,
+    }),
+  };
 });
 
 app.post("/api/accounts/:id/check", async (request) => {
@@ -218,7 +249,15 @@ app.post("/api/accounts/:id/reauth", async (request) => {
   const id = Number((request.params as {id: string}).id);
   const account = getAccount(id);
   const job = createJob("reauth", `重新授权 ${account.email}`, {id});
-  void runJob(job.id, async () => reauthorizeAccount(id, job.id), {exclusiveRegister: true});
+  void runJob(job.id, async () => {
+    const result = await reauthorizeAccount(id, job.id);
+    try {
+      await pushAccountToBoundPlatforms(id);
+      return {...result, boundPlatformPush: "success"};
+    } catch (error) {
+      return {...result, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)};
+    }
+  }, {exclusiveRegister: true});
   return {job};
 });
 
@@ -226,6 +265,22 @@ app.post("/api/accounts/:id/push", async (request) => {
   const id = Number((request.params as {id: string}).id);
   const body = request.body as {target?: PushTarget; serviceIds?: number[]} | undefined;
   return pushAccount(id, body?.target ?? "both", body?.serviceIds);
+});
+
+app.get("/api/accounts/:id/platform-bindings", async (request) => {
+  const id = Number((request.params as {id: string}).id);
+  return {bindings: listAccountPlatformBindings(id)};
+});
+
+app.put("/api/accounts/:id/platform-bindings", async (request) => {
+  const id = Number((request.params as {id: string}).id);
+  const body = request.body as {serviceIds?: number[]; mode?: BindingMode} | undefined;
+  return {bindings: setAccountPlatformBindings(id, body?.serviceIds ?? [], body?.mode ?? "replace")};
+});
+
+app.post("/api/accounts/bulk/platform-bindings", async (request) => {
+  const body = request.body as {ids?: number[]; serviceIds?: number[]; mode?: BindingMode} | undefined;
+  return bulkSetAccountPlatformBindings(body?.ids ?? [], body?.serviceIds ?? [], body?.mode ?? "replace");
 });
 
 app.post("/api/accounts/bulk/:action", async (request) => {
@@ -243,7 +298,13 @@ app.post("/api/accounts/bulk/:action", async (request) => {
         return {id, result: await checkAccount(id, true)};
       }
       if (action === "reauth") {
-        return {id, result: await reauthorizeAccount(id, job.id)};
+        const result = await reauthorizeAccount(id, job.id);
+        try {
+          await pushAccountToBoundPlatforms(id);
+          return {id, result: {...result, boundPlatformPush: "success"}};
+        } catch (error) {
+          return {id, result: {...result, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)}};
+        }
       }
       if (action === "push") {
         return {id, result: await pushAccount(id, body?.target ?? "both", body?.serviceIds)};
@@ -392,7 +453,6 @@ async function registerStatic(): Promise<void> {
     await app.register(fastifyStatic, {
       root: WEB_DIST,
       prefix: "/",
-      wildcard: false,
     });
   }
   app.setNotFoundHandler(async (request, reply) => {

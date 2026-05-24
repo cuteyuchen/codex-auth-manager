@@ -14,6 +14,11 @@ import {
   saveAuthFileJsonObjectToCPAService,
   uploadAuthFileToSub2APIService,
 } from "./integration-service.js";
+import {
+  listAccountPlatformBindings,
+  updateBindingPushResult,
+  type BoundPlatformService,
+} from "./account-platform-binding-service.js";
 
 export interface AuthRecord {
     access_token?: string;
@@ -88,6 +93,19 @@ export interface AuthSummary {
     windows: AccountUsageWindow[];
 }
 
+export type CredentialSourceKind = "local" | "cpa" | "sub2api";
+
+export interface UpsertAuthOptions {
+    sourceKind?: CredentialSourceKind;
+    sourceName?: string | null;
+    sourceServiceId?: number | null;
+    sourceRemoteId?: string | null;
+    syncedAt?: string | null;
+    preserveSource?: boolean;
+    preserveAccountMetadata?: boolean;
+    activate?: boolean;
+}
+
 const DEFAULT_AUTH_DIR = path.resolve(process.cwd(), "auth");
 const REQUEST_TIMEOUT_MS = 15000;
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -98,7 +116,7 @@ function maskPath(filePath: string): string {
 
 function isExcludedAuthDir(dirPath: string): boolean {
   const parts = path.relative(DEFAULT_AUTH_DIR, dirPath).split(path.sep).map((item) => item.toLowerCase());
-  return parts.includes("401");
+  return parts.includes("401") || parts.includes("platforms");
 }
 
 export async function collectAuthFiles(rootDir = DEFAULT_AUTH_DIR): Promise<string[]> {
@@ -606,9 +624,8 @@ export async function importAuthFiles(): Promise<{imported: number; updated: num
         continue;
       }
 
-      const account = await upsertAccountFromAuthRecord(record, filePath);
       const authExists = getDb().prepare("SELECT id FROM auth_files WHERE file_path = ?").get(filePath);
-      upsertAuthFile(account.id, filePath, record);
+      await upsertAccountFromAuthRecord(record, filePath);
       if (authExists) {
         updated += 1;
       } else {
@@ -622,20 +639,54 @@ export async function importAuthFiles(): Promise<{imported: number; updated: num
   return {imported, updated, skipped};
 }
 
-export async function upsertAccountFromAuthRecord(record: AuthRecord, filePath?: string): Promise<AccountRow> {
+export async function upsertAccountFromAuthRecord(
+  record: AuthRecord,
+  filePath?: string,
+  options: UpsertAuthOptions = {},
+): Promise<AccountRow> {
   const claims = decodeJwtClaims(record.id_token ?? record.access_token);
   const email = record.email?.trim() || claims?.email?.trim();
   if (!email) {
     throw new Error("auth 记录缺少 email");
   }
   const timestamp = currentTimestamp();
+  const sourceKind = options.sourceKind ?? (filePath && !options.preserveSource ? "local" : undefined);
+  const sourceName = options.sourceName ?? null;
+  const sourceServiceId = options.sourceServiceId ?? null;
+  const sourceRemoteId = options.sourceRemoteId ?? null;
+  const syncedAt = options.syncedAt ?? timestamp;
   const existing = getDb().prepare("SELECT * FROM accounts WHERE email = ?").get(email) as AccountRow | undefined;
   const plan = claims?.["https://api.openai.com/auth"]?.chatgpt_plan_type?.trim() || existing?.plan || null;
   const credentialType = resolveCredentialType(record);
   const initialStatusCode = credentialType === "access_token_only" ? "access_token_only" : "unchecked";
   const initialStatusLabel = credentialType === "access_token_only" ? "只保存 accessToken" : "未检查";
   if (existing) {
-    getDb().prepare(`
+    if (options.preserveAccountMetadata) {
+      getDb().prepare(`
+            UPDATE accounts
+            SET credential_type = @credential_type,
+                credential_source_kind = COALESCE(@credential_source_kind, credential_source_kind),
+                credential_source_name = COALESCE(@credential_source_name, credential_source_name),
+                credential_source_service_id = COALESCE(@credential_source_service_id, credential_source_service_id),
+                credential_source_remote_id = COALESCE(@credential_source_remote_id, credential_source_remote_id),
+                credential_synced_at = CASE
+                    WHEN @credential_source_kind IS NULL THEN credential_synced_at
+                    ELSE @credential_synced_at
+                END,
+                updated_at = @updated_at
+            WHERE id = @id
+        `).run({
+        id: existing.id,
+        credential_type: credentialType,
+        credential_source_kind: sourceKind ?? null,
+        credential_source_name: sourceName,
+        credential_source_service_id: sourceServiceId,
+        credential_source_remote_id: sourceRemoteId,
+        credential_synced_at: syncedAt,
+        updated_at: timestamp,
+      });
+    } else {
+      getDb().prepare(`
             UPDATE accounts
             SET provider = COALESCE(provider, @provider),
                 status = CASE WHEN status = 'unknown' THEN 'imported' ELSE status END,
@@ -644,29 +695,47 @@ export async function upsertAccountFromAuthRecord(record: AuthRecord, filePath?:
                 status_code = COALESCE(status_code, @status_code),
                 status_label = COALESCE(status_label, @status_label),
                 last_auth_at = COALESCE(last_auth_at, @last_auth_at),
+                credential_source_kind = COALESCE(@credential_source_kind, credential_source_kind),
+                credential_source_name = COALESCE(@credential_source_name, credential_source_name),
+                credential_source_service_id = COALESCE(@credential_source_service_id, credential_source_service_id),
+                credential_source_remote_id = COALESCE(@credential_source_remote_id, credential_source_remote_id),
+                credential_synced_at = CASE
+                    WHEN @credential_source_kind IS NULL THEN credential_synced_at
+                    ELSE @credential_synced_at
+                END,
                 updated_at = @updated_at
             WHERE id = @id
         `).run({
-      id: existing.id,
-      provider: appConfig.provider,
-      plan,
-      credential_type: credentialType,
-      status_code: initialStatusCode,
-      status_label: initialStatusLabel,
-      last_auth_at: record.last_refresh ?? timestamp,
-      updated_at: timestamp,
-    });
+        id: existing.id,
+        provider: appConfig.provider,
+        plan,
+        credential_type: credentialType,
+        status_code: initialStatusCode,
+        status_label: initialStatusLabel,
+        last_auth_at: record.last_refresh ?? timestamp,
+        credential_source_kind: sourceKind ?? null,
+        credential_source_name: sourceName,
+        credential_source_service_id: sourceServiceId,
+        credential_source_remote_id: sourceRemoteId,
+        credential_synced_at: syncedAt,
+        updated_at: timestamp,
+      });
+    }
   } else {
     getDb().prepare(`
             INSERT INTO accounts (
                 email, password_encrypted, provider, status, plan,
                 last_auth_at, auto_reauth, created_at, updated_at,
-                credential_type, status_code, status_label
+                credential_type, status_code, status_label,
+                credential_source_kind, credential_source_name, credential_source_service_id,
+                credential_source_remote_id, credential_synced_at
             )
             VALUES (
                 @email, NULL, @provider, 'imported', @plan,
                 @last_auth_at, 1, @created_at, @updated_at,
-                @credential_type, @status_code, @status_label
+                @credential_type, @status_code, @status_label,
+                @credential_source_kind, @credential_source_name, @credential_source_service_id,
+                @credential_source_remote_id, @credential_synced_at
             )
         `).run({
       email,
@@ -678,45 +747,70 @@ export async function upsertAccountFromAuthRecord(record: AuthRecord, filePath?:
       credential_type: credentialType,
       status_code: initialStatusCode,
       status_label: initialStatusLabel,
+      credential_source_kind: sourceKind ?? null,
+      credential_source_name: sourceName,
+      credential_source_service_id: sourceServiceId,
+      credential_source_remote_id: sourceRemoteId,
+      credential_synced_at: sourceKind ? syncedAt : null,
     });
   }
 
   const account = getDb().prepare("SELECT * FROM accounts WHERE email = ?").get(email) as AccountRow;
   if (filePath) {
-    upsertAuthFile(account.id, filePath, record);
+    upsertAuthFile(account.id, filePath, record, options);
   }
   return account;
 }
 
-export function upsertAuthFile(accountId: number, filePath: string, record: AuthRecord): AuthFileRow {
+export function upsertAuthFile(accountId: number, filePath: string, record: AuthRecord, options: UpsertAuthOptions = {}): AuthFileRow {
   const timestamp = currentTimestamp();
   const credentialType = resolveCredentialType(record);
-  getDb().prepare("UPDATE auth_files SET active = 0 WHERE account_id = ? AND file_path <> ?").run(accountId, filePath);
+  const shouldActivate = options.activate !== false;
+  if (shouldActivate) {
+    getDb().prepare("UPDATE auth_files SET active = 0 WHERE account_id = ? AND file_path <> ?").run(accountId, filePath);
+  }
   getDb().prepare(`
         INSERT INTO auth_files (
             account_id, file_path, file_name, active, token_expires_at, credential_type,
-            current_step, step_status, last_step_at, created_at, updated_at
+            current_step, step_status, last_step_at,
+            credential_source_kind, credential_source_name, credential_source_service_id,
+            credential_source_remote_id, credential_synced_at,
+            created_at, updated_at
         )
         VALUES (
-            @account_id, @file_path, @file_name, 1, @token_expires_at, @credential_type,
-            @current_step, @step_status, @last_step_at, @created_at, @updated_at
+            @account_id, @file_path, @file_name, @active, @token_expires_at, @credential_type,
+            @current_step, @step_status, @last_step_at,
+            @credential_source_kind, @credential_source_name, @credential_source_service_id,
+            @credential_source_remote_id, @credential_synced_at,
+            @created_at, @updated_at
         )
         ON CONFLICT(file_path) DO UPDATE SET
             account_id = excluded.account_id,
             file_name = excluded.file_name,
-            active = 1,
+            active = excluded.active,
             token_expires_at = excluded.token_expires_at,
             credential_type = excluded.credential_type,
+            credential_source_kind = COALESCE(excluded.credential_source_kind, credential_source_kind),
+            credential_source_name = COALESCE(excluded.credential_source_name, credential_source_name),
+            credential_source_service_id = COALESCE(excluded.credential_source_service_id, credential_source_service_id),
+            credential_source_remote_id = COALESCE(excluded.credential_source_remote_id, credential_source_remote_id),
+            credential_synced_at = COALESCE(excluded.credential_synced_at, credential_synced_at),
             updated_at = excluded.updated_at
     `).run({
     account_id: accountId,
     file_path: filePath,
     file_name: path.basename(filePath),
+    active: shouldActivate ? 1 : 0,
     token_expires_at: record.expired ?? record.expires_at ?? null,
     credential_type: credentialType,
     current_step: credentialType === "access_token_only" ? "保存 accessToken" : "导入 auth",
     step_status: "success",
     last_step_at: timestamp,
+    credential_source_kind: options.preserveSource ? null : (options.sourceKind ?? (filePath ? "local" : null)),
+    credential_source_name: options.sourceName ?? null,
+    credential_source_service_id: options.sourceServiceId ?? null,
+    credential_source_remote_id: options.sourceRemoteId ?? null,
+    credential_synced_at: options.sourceKind ? (options.syncedAt ?? timestamp) : null,
     created_at: timestamp,
     updated_at: timestamp,
   });
@@ -737,6 +831,7 @@ export interface AccountListItem {
     last_auth_at: string | null;
     last_error: string | null;
     auto_reauth: number;
+    has_password: boolean | number;
     created_at: string;
     updated_at: string;
     auth_file_path: string | null;
@@ -748,9 +843,19 @@ export interface AccountListItem {
     status_code: string | null;
     status_label: string | null;
     credential_type: string | null;
+    credential_source_kind: string | null;
+    credential_source_name: string | null;
+    credential_source_service_id: number | null;
+    credential_source_remote_id: string | null;
+    credential_synced_at: string | null;
     source_id: number | null;
+    source_name: string | null;
+    source_provider: string | null;
+    source_vendor: string | null;
+    source_batch_note: string | null;
     mailbox_id: number | null;
     usage_windows: AccountUsageWindow[];
+    platform_bindings: BoundPlatformService[];
 }
 
 export interface AccountFilters {
@@ -782,12 +887,25 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
             a.last_auth_at,
             a.last_error,
             a.auto_reauth,
+            CASE
+                WHEN a.password_encrypted IS NOT NULL AND a.password_encrypted <> '' THEN 1
+                ELSE 0
+            END AS has_password,
             a.created_at,
             a.updated_at,
             a.status_code,
             a.status_label,
             a.credential_type,
+            a.credential_source_kind,
+            a.credential_source_name,
+            a.credential_source_service_id,
+            a.credential_source_remote_id,
+            a.credential_synced_at,
             a.source_id,
+            ms.name AS source_name,
+            ms.provider AS source_provider,
+            ms.vendor AS source_vendor,
+            ms.batch_note AS source_batch_note,
             a.mailbox_id,
             af.file_path AS auth_file_path,
             af.file_name AS auth_file_name,
@@ -797,6 +915,7 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
             af.last_step_at AS last_step_at
         FROM accounts a
         LEFT JOIN auth_files af ON af.account_id = a.id AND af.active = 1
+        LEFT JOIN mail_sources ms ON ms.id = a.source_id
         WHERE (@query = '' OR a.email LIKE @q OR a.status LIKE @q OR a.status_code LIKE @q)
           AND (@status = '' OR COALESCE(a.status_code, a.status) = @status)
           AND (@credentialType = '' OR COALESCE(af.credential_type, a.credential_type, 'none') = @credentialType)
@@ -833,6 +952,8 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
   }
   for (const row of rows) {
     row.usage_windows = windowsByAccount.get(row.id) ?? [];
+    row.platform_bindings = listAccountPlatformBindings(row.id);
+    row.has_password = Boolean(row.has_password);
     row.status_code = row.status_code ?? row.status;
     row.status_label = row.status_label ?? row.status;
     row.credential_type = row.auth_credential_type ?? row.credential_type ?? "none";
@@ -870,6 +991,42 @@ export async function setAccountPassword(accountId: number, password: string): P
     `).run(encrypted || null, currentTimestamp(), accountId);
 }
 
+export async function updateAccountProfile(accountId: number, input: {password?: string; sourceId?: number | null}): Promise<AccountRow> {
+  getAccount(accountId);
+  if (input.sourceId != null) {
+    const source = getDb().prepare("SELECT id FROM mail_sources WHERE id = ?").get(input.sourceId);
+    if (!source) {
+      throw new Error(`邮箱来源不存在: ${input.sourceId}`);
+    }
+  }
+  const encrypted = input.password === undefined ? undefined : await encryptSecret(input.password);
+  getDb().prepare(`
+        UPDATE accounts
+        SET password_encrypted = CASE
+                WHEN @password_provided = 1 THEN @password_encrypted
+                ELSE password_encrypted
+            END,
+            source_id = CASE
+                WHEN @source_provided = 1 THEN @source_id
+                ELSE source_id
+            END,
+            mailbox_id = CASE
+                WHEN @source_provided = 1 THEN NULL
+                ELSE mailbox_id
+            END,
+            updated_at = @updated_at
+        WHERE id = @id
+    `).run({
+    id: accountId,
+    password_provided: input.password === undefined ? 0 : 1,
+    password_encrypted: encrypted || null,
+    source_provided: Object.hasOwn(input, "sourceId") ? 1 : 0,
+    source_id: input.sourceId ?? null,
+    updated_at: currentTimestamp(),
+  });
+  return getAccount(accountId);
+}
+
 export function updateAuthFileStep(accountId: number, step: string, status: "running" | "success" | "failed" = "running"): void {
   getDb().prepare(`
         UPDATE auth_files
@@ -891,11 +1048,7 @@ export async function getAccountPassword(account: AccountRow): Promise<string> {
   if (account.password_encrypted) {
     return decryptSecret(account.password_encrypted);
   }
-  const password = appConfig.defaultPassword.trim();
-  if (!password) {
-    throw new Error("账号未保存密码，且配置页未设置默认密码");
-  }
-  return password;
+  throw new Error("账号未保存密码，请先在账号管理中为该账号添加密码");
 }
 
 function updateAccountFromSummary(accountId: number, summary: AuthSummary): void {
@@ -966,7 +1119,7 @@ export async function checkAccount(accountId: number, forceRefresh = false): Pro
   updateAccountFromSummary(accountId, summary);
   if (summary.refreshed) {
     const record = await loadAuthRecord(authFile.file_path);
-    upsertAuthFile(accountId, authFile.file_path, record);
+    upsertAuthFile(accountId, authFile.file_path, record, {preserveSource: true});
   }
   return summary;
 }
@@ -1032,20 +1185,31 @@ export async function pushAccount(accountId: number, target: PushTarget, service
   const fileName = authFile.file_name;
   const result: Record<string, unknown> = {};
   const timestamp = currentTimestamp();
+  const effectiveServiceIds = serviceIds && serviceIds.length ? serviceIds : undefined;
 
   if (target === "cpa" || target === "both") {
-    const services = await resolvePushServices("cpa", serviceIds);
+    const services = await resolvePushServices("cpa", effectiveServiceIds);
     if (!services.length) {
       assertPushTargetConfigured("cpa");
     }
     updateAuthFileStep(accountId, "推送 CPA 中", "running");
     const serviceResults = [];
     for (const service of services) {
-      await saveAuthFileJsonObjectToCPAService({
-        baseUrl: service.baseUrl,
-        managementKey: service.secret,
-      }, fileName, record as unknown as Record<string, unknown>);
-      serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, status: "success"});
+      try {
+        await saveAuthFileJsonObjectToCPAService({
+          baseUrl: service.baseUrl,
+          managementKey: service.secret,
+        }, fileName, record as unknown as Record<string, unknown>);
+        if (service.id) {
+          updateBindingPushResult(accountId, service.id, "success", "CPA 推送成功");
+        }
+        serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, status: "success"});
+      } catch (error) {
+        if (service.id) {
+          updateBindingPushResult(accountId, service.id, "failed", error instanceof Error ? error.message : String(error));
+        }
+        throw error;
+      }
     }
     getDb().prepare(`
             UPDATE auth_files
@@ -1056,19 +1220,29 @@ export async function pushAccount(accountId: number, target: PushTarget, service
   }
 
   if (target === "sub2api" || target === "both") {
-    const services = await resolvePushServices("sub2api", serviceIds);
+    const services = await resolvePushServices("sub2api", effectiveServiceIds);
     if (!services.length) {
       assertPushTargetConfigured("sub2api");
     }
     updateAuthFileStep(accountId, "推送 Sub2API 中", "running");
     const serviceResults = [];
     for (const service of services) {
-      const uploadResult = await uploadAuthFileToSub2APIService({
-        baseUrl: service.baseUrl,
-        adminApiKey: service.secret,
-        options: service.options,
-      }, fileName, record);
-      serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, ...uploadResult});
+      try {
+        const uploadResult = await uploadAuthFileToSub2APIService({
+          baseUrl: service.baseUrl,
+          adminApiKey: service.secret,
+          options: service.options,
+        }, fileName, record);
+        if (service.id) {
+          updateBindingPushResult(accountId, service.id, "success", "Sub2API 推送成功");
+        }
+        serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, ...uploadResult});
+      } catch (error) {
+        if (service.id) {
+          updateBindingPushResult(accountId, service.id, "failed", error instanceof Error ? error.message : String(error));
+        }
+        throw error;
+      }
     }
     getDb().prepare(`
             UPDATE auth_files
@@ -1079,6 +1253,24 @@ export async function pushAccount(accountId: number, target: PushTarget, service
   }
   updateAuthFileStep(accountId, "推送完成", "success");
 
+  return result;
+}
+
+export async function pushAccountToBoundPlatforms(accountId: number): Promise<Record<string, unknown>> {
+  const services = listAccountPlatformBindings(accountId).filter((service) => service.enabled);
+  if (!services.length) {
+    updateAuthFileStep(accountId, "无绑定平台，跳过自动同步", "success");
+    return {skipped: true, reason: "no_bound_platforms"};
+  }
+  const result: Record<string, unknown> = {};
+  const cpaIds = services.filter((service) => service.kind === "cpa").map((service) => service.id);
+  const sub2apiIds = services.filter((service) => service.kind === "sub2api").map((service) => service.id);
+  if (cpaIds.length) {
+    result.cpa = await pushAccount(accountId, "cpa", cpaIds);
+  }
+  if (sub2apiIds.length) {
+    result.sub2api = await pushAccount(accountId, "sub2api", sub2apiIds);
+  }
   return result;
 }
 

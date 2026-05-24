@@ -187,6 +187,7 @@ onMounted(load);
     </div>
 
     <el-card shadow="never">
+      <el-alert title="服务优先级会用于平台凭据同步冲突裁决：同邮箱多平台凭据按优先级小的服务作为本地 active auth。" type="info" show-icon class="mb-3" />
       <div class="data-table-wrap">
         <el-table v-loading="loading" :data="filteredServices" border row-key="id">
           <template #empty>
