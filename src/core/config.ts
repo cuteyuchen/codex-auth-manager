@@ -40,6 +40,8 @@ interface AppConfigInput {
   sub2apiUpdateExisting?: unknown;
   sub2apiSkipDefaultGroupBind?: unknown;
   sub2apiConfirmMixedChannelRisk?: unknown;
+  webAccessPassword?: unknown;
+  webSessionSecret?: unknown;
 }
 
 export interface AppConfig {
@@ -78,6 +80,8 @@ export interface AppConfig {
   sub2apiUpdateExisting: boolean;
   sub2apiSkipDefaultGroupBind: boolean;
   sub2apiConfirmMixedChannelRisk: boolean;
+  webAccessPassword: string;
+  webSessionSecret: string;
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -96,8 +100,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   defaultProxyUrl: "http://127.0.0.1:10808",
   hotmailMode: "graph",
   heroSMSApiKey: "",
-  heroSMSCountry: 52,
-  heroSMSMaxPrice: 0.05,
+  heroSMSCountry: 7,
+  heroSMSMaxPrice: 0.1,
   heroSMSPollAttempts: 10,
   heroSMSPollIntervalMs: 3000,
   cliproxyApiAutoUploadAuth: false,
@@ -116,6 +120,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   sub2apiUpdateExisting: true,
   sub2apiSkipDefaultGroupBind: false,
   sub2apiConfirmMixedChannelRisk: false,
+  webAccessPassword: "",
+  webSessionSecret: "",
 };
 
 export const SECRET_CONFIG_KEYS = new Set<keyof AppConfig>([
@@ -127,13 +133,20 @@ export const SECRET_CONFIG_KEYS = new Set<keyof AppConfig>([
   "heroSMSApiKey",
   "cliproxyApiManagementKey",
   "sub2apiAdminApiKey",
+  "webAccessPassword",
+  "webSessionSecret",
 ]);
 
 interface AppSettingRow {
-  key: string;
-  value_json: string;
-  is_secret: number;
+    key: string;
+    value_json: string;
+    is_secret: number;
 }
+
+const LEGACY_DEFAULT_OVERRIDES: Partial<Record<keyof AppConfig, {from: unknown; to: unknown}>> = {
+  heroSMSCountry: {from: 52, to: DEFAULT_CONFIG.heroSMSCountry},
+  heroSMSMaxPrice: {from: 0.05, to: DEFAULT_CONFIG.heroSMSMaxPrice},
+};
 
 export function getConfigKeys(): Array<keyof AppConfig> {
   return Object.keys(DEFAULT_CONFIG) as Array<keyof AppConfig>;
@@ -278,6 +291,8 @@ function normalizeConfig(parsed: AppConfigInput): AppConfig {
       parsed.sub2apiConfirmMixedChannelRisk,
       DEFAULT_CONFIG.sub2apiConfirmMixedChannelRisk,
     ),
+    webAccessPassword: normalizeString(parsed.webAccessPassword, DEFAULT_CONFIG.webAccessPassword),
+    webSessionSecret: normalizeString(parsed.webSessionSecret, DEFAULT_CONFIG.webSessionSecret),
   };
 }
 
@@ -326,8 +341,28 @@ function seedDefaultSettings(): void {
   }
 }
 
+function migrateLegacyDefaultSettings(): void {
+  const statement = getDb().prepare("SELECT key, value_json, is_secret FROM app_settings WHERE key = ?");
+  for (const [key, override] of Object.entries(LEGACY_DEFAULT_OVERRIDES) as Array<[keyof AppConfig, {from: unknown; to: unknown}]>) {
+    const row = statement.get(key) as AppSettingRow | undefined;
+    if (!row || row.is_secret) {
+      continue;
+    }
+    let current: unknown;
+    try {
+      current = JSON.parse(row.value_json) as unknown;
+    } catch {
+      continue;
+    }
+    if (current === override.from) {
+      saveSetting(key, override.to);
+    }
+  }
+}
+
 export function loadConfig(): AppConfig {
   seedDefaultSettings();
+  migrateLegacyDefaultSettings();
   const rows = getDb().prepare("SELECT key, value_json, is_secret FROM app_settings").all() as AppSettingRow[];
   const parsed: AppConfigInput = {};
   for (const row of rows) {

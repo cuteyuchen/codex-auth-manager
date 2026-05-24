@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {computed, onMounted, reactive, ref, watch} from "vue";
 import {ElMessage} from "element-plus";
-import {Check, Refresh} from "@element-plus/icons-vue";
+import {Check, Connection, Refresh} from "@element-plus/icons-vue";
 import {apiGet, apiSend, type HeroSmsBalance, type HeroSmsCountry, type HeroSmsPrice} from "../api";
 
 const config = reactive<Record<string, any>>({});
@@ -14,6 +14,15 @@ const heroError = ref("");
 const heroPriceError = ref("");
 const heroBalanceError = ref("");
 const loadingHero = ref(false);
+const testingProxy = ref(false);
+const proxyTestResult = ref<{
+  ok: boolean;
+  proxyUrl: string;
+  targetUrl: string;
+  status: number | null;
+  elapsedMs: number;
+  message: string;
+} | null>(null);
 
 const secretKeys = [
   "defaultPassword",
@@ -22,9 +31,27 @@ const secretKeys = [
   "2925Password",
   "cloudflareApiKey",
   "heroSMSApiKey",
-  "cliproxyApiManagementKey",
-  "sub2apiAdminApiKey",
+  "webAccessPassword",
 ];
+
+const legacyPushConfigKeys = new Set([
+  "cliproxyApiAutoUploadAuth",
+  "cliproxyApiBaseUrl",
+  "cliproxyApiManagementKey",
+  "sub2apiAutoUploadAuth",
+  "sub2apiBaseUrl",
+  "sub2apiAdminApiKey",
+  "sub2apiGroupIds",
+  "sub2apiProxyId",
+  "sub2apiConcurrency",
+  "sub2apiPriority",
+  "sub2apiRateMultiplier",
+  "sub2apiLoadFactor",
+  "sub2apiAutoPauseOnExpired",
+  "sub2apiUpdateExisting",
+  "sub2apiSkipDefaultGroupBind",
+  "sub2apiConfirmMixedChannelRisk",
+]);
 
 const selectedHeroPrice = computed(() => heroPrices.value[0]);
 
@@ -60,6 +87,9 @@ function secretPlaceholder(key: string) {
 async function save() {
   const patch: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(config)) {
+    if (legacyPushConfigKeys.has(key)) {
+      continue;
+    }
     if (!secretKeys.includes(key)) {
       patch[key] = value;
     }
@@ -82,6 +112,25 @@ async function save() {
     await loadHeroPrices();
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function testDefaultProxy() {
+  testingProxy.value = true;
+  proxyTestResult.value = null;
+  try {
+    proxyTestResult.value = await apiSend<typeof proxyTestResult.value>("/api/config/proxy-test", "POST", {
+      proxyUrl: config.defaultProxyUrl || "",
+    });
+    if (proxyTestResult.value?.ok) {
+      ElMessage.success(`代理可用，耗时 ${proxyTestResult.value.elapsedMs}ms`);
+    } else {
+      ElMessage.error(proxyTestResult.value?.message || "代理不可用");
+    }
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    testingProxy.value = false;
   }
 }
 
@@ -156,7 +205,19 @@ onMounted(load);
           <template #header>基础</template>
           <el-form label-position="top" :model="config">
             <el-alert title="配置页是全局配置唯一入口；邮箱 provider 与 Hotmail 模式已移到注册页，那里只影响单次 Web 注册任务。" type="info" show-icon class="mb-3" />
-            <el-form-item label="默认代理"><el-input v-model="config.defaultProxyUrl" /></el-form-item>
+            <el-form-item label="默认代理">
+              <el-input v-model="config.defaultProxyUrl" placeholder="http://127.0.0.1:10808">
+                <template #append>
+                  <el-button :icon="Connection" :loading="testingProxy" @click="testDefaultProxy">测试</el-button>
+                </template>
+              </el-input>
+              <div v-if="proxyTestResult" class="mt-2 w-full rounded-lg border px-3 py-2 text-sm" :class="proxyTestResult.ok ? 'border-green-200 bg-green-50 text-green-700' : 'border-red-200 bg-red-50 text-red-700'">
+                <div class="font-medium">{{ proxyTestResult.message }}</div>
+                <div class="mt-1 text-xs opacity-80">
+                  目标 {{ proxyTestResult.targetUrl }}；状态 {{ proxyTestResult.status ?? "-" }}；耗时 {{ proxyTestResult.elapsedMs }}ms
+                </div>
+              </div>
+            </el-form-item>
             <el-row :gutter="12">
               <el-col :span="12">
                 <el-form-item label="默认密码">
@@ -178,23 +239,19 @@ onMounted(load);
             <el-alert :title="`上次结果：${scheduler.lastRunStatus || 'never'}；计划：${scheduler.nextRunHint || '-'}`" type="info" show-icon />
           </el-form>
         </el-card>
-      </el-col>
 
-      <el-col :xs="24" :lg="12">
         <el-card shadow="never" class="mb-4">
-          <template #header>远端推送</template>
+          <template #header>访问控制</template>
           <el-form label-position="top" :model="config">
-            <el-form-item label="CPA Base URL"><el-input v-model="config.cliproxyApiBaseUrl" /></el-form-item>
-            <el-form-item label="CPA 管理密钥">
-              <el-input v-model="secretInputs.cliproxyApiManagementKey" type="password" show-password :placeholder="secretPlaceholder('cliproxyApiManagementKey')" />
-            </el-form-item>
-            <el-form-item label="Sub2API Base URL"><el-input v-model="config.sub2apiBaseUrl" /></el-form-item>
-            <el-form-item label="Sub2API Admin Key">
-              <el-input v-model="secretInputs.sub2apiAdminApiKey" type="password" show-password :placeholder="secretPlaceholder('sub2apiAdminApiKey')" />
+            <el-alert title="留空表示本机访问不需要密码；如果服务绑定到非本地地址，必须先设置访问密码。" type="warning" show-icon class="mb-3" />
+            <el-form-item label="Web 访问密码">
+              <el-input v-model="secretInputs.webAccessPassword" type="password" show-password :placeholder="secretPlaceholder('webAccessPassword')" />
             </el-form-item>
           </el-form>
         </el-card>
+      </el-col>
 
+      <el-col :xs="24" :lg="12">
         <el-card shadow="never">
           <template #header>
             <div class="flex items-center justify-between">

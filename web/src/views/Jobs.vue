@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {computed, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
 import {ElMessage} from "element-plus";
-import {Promotion, Refresh} from "@element-plus/icons-vue";
+import {CircleClose, Promotion, Refresh} from "@element-plus/icons-vue";
 import {apiGet, apiSend, type Job, type JobEvent} from "../api";
 
 const jobs = ref<Job[]>([]);
@@ -12,9 +12,11 @@ const currentPage = ref(1);
 const pageSize = ref(20);
 const logBoxRef = ref<HTMLElement | null>(null);
 const stickToBottom = ref(true);
+const cancelling = ref(false);
 let source: EventSource | null = null;
 
 const pagedJobs = computed(() => jobs.value.slice((currentPage.value - 1) * pageSize.value, currentPage.value * pageSize.value));
+const activeSelectedJob = computed(() => selectedJob.value ? isActiveJob(selectedJob.value) : false);
 
 async function load() {
   try {
@@ -43,6 +45,10 @@ async function selectJob(job: Job) {
   source = new EventSource(`/api/jobs/${job.id}/stream`);
   source.onmessage = (message) => {
     const event = JSON.parse(message.data) as JobEvent;
+    if (event.message.startsWith("jobStatus:")) {
+      updateJobFromStatus(event.job_id, event.message.slice("jobStatus:".length));
+      return;
+    }
     if (event.id > 0 && !events.value.some((item) => item.id === event.id)) {
       events.value.push(event);
       void scrollLogToBottom();
@@ -78,6 +84,47 @@ async function submitInput() {
     ElMessage.success("输入已提交");
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function cancelSelectedJob() {
+  if (!selectedJob.value || !activeSelectedJob.value) {
+    return;
+  }
+  cancelling.value = true;
+  try {
+    const payload = await apiSend<{job: Job}>(`/api/jobs/${selectedJob.value.id}/cancel`, "POST");
+    applyJobUpdate(payload.job);
+    ElMessage.success("已请求结束任务");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    cancelling.value = false;
+  }
+}
+
+function isActiveJob(job: Job): boolean {
+  return ["queued", "running", "waiting_input"].includes(job.status);
+}
+
+function applyJobUpdate(job: Job) {
+  jobs.value = jobs.value.map((item) => item.id === job.id ? job : item);
+  if (selectedJob.value?.id === job.id) {
+    selectedJob.value = job;
+  }
+}
+
+function updateJobFromStatus(jobId: number, status: string) {
+  const waiting = status === "waiting_input";
+  const patch = (job: Job): Job => ({
+    ...job,
+    status,
+    waiting_for_input: waiting ? job.waiting_for_input : 0,
+    input_prompt: waiting ? job.input_prompt : null,
+  });
+  jobs.value = jobs.value.map((job) => job.id === jobId ? patch(job) : job);
+  if (selectedJob.value?.id === jobId) {
+    selectedJob.value = patch(selectedJob.value);
   }
 }
 
@@ -142,7 +189,21 @@ watch(() => events.value.length, () => {
           <template #header>
             <div class="flex flex-wrap items-center justify-between gap-2">
               <strong>{{ selectedJob ? `#${selectedJob.id} ${selectedJob.title}` : "未选择任务" }}</strong>
-              <el-tag v-if="selectedJob" :type="jobType(selectedJob.status)">{{ selectedJob.status }}</el-tag>
+              <div class="flex items-center gap-2">
+                <el-button
+                  v-if="selectedJob"
+                  :icon="CircleClose"
+                  type="danger"
+                  plain
+                  size="small"
+                  :loading="cancelling"
+                  :disabled="!activeSelectedJob"
+                  @click="cancelSelectedJob"
+                >
+                  结束任务
+                </el-button>
+                <el-tag v-if="selectedJob" :type="jobType(selectedJob.status)">{{ selectedJob.status }}</el-tag>
+              </div>
             </div>
           </template>
           <div v-if="selectedJob?.waiting_for_input" class="mb-3 flex gap-2">

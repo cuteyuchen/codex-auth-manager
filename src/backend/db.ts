@@ -1,4 +1,4 @@
-import {copyFileSync, existsSync, mkdirSync} from "node:fs";
+import {copyFileSync, existsSync, mkdirSync, statSync} from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 
@@ -131,6 +131,25 @@ export interface JobEventRow {
     level: string;
     message: string;
     created_at: string;
+}
+
+export type IntegrationServiceKind = "cpa" | "sub2api";
+
+export interface IntegrationServiceRow {
+    id: number;
+    kind: IntegrationServiceKind;
+    name: string;
+    base_url: string;
+    secret_encrypted: string;
+    enabled: number;
+    priority: number;
+    include_proxy_url: number;
+    options_json: string;
+    last_test_at: string | null;
+    last_test_status: string | null;
+    last_test_message: string | null;
+    created_at: string;
+    updated_at: string;
 }
 
 let db: Database.Database | null = null;
@@ -332,6 +351,27 @@ function migrate(database: Database.Database): void {
         CREATE INDEX IF NOT EXISTS idx_mail_events_mailbox ON mail_events(mailbox_id, id);
     `);
 
+  database.exec(`
+        CREATE TABLE IF NOT EXISTS integration_services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('cpa', 'sub2api')),
+            name TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            secret_encrypted TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 0,
+            include_proxy_url INTEGER NOT NULL DEFAULT 0,
+            options_json TEXT NOT NULL DEFAULT '{}',
+            last_test_at TEXT,
+            last_test_status TEXT,
+            last_test_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_integration_services_kind ON integration_services(kind, enabled, priority);
+    `);
+
   addColumnIfMissing(database, "mail_sources", "mail_type_id", "INTEGER REFERENCES mail_types(id) ON DELETE SET NULL");
   addColumnIfMissing(database, "mail_sources", "vendor", "TEXT");
   addColumnIfMissing(database, "mail_sources", "batch_note", "TEXT");
@@ -445,4 +485,34 @@ export function getSettings(): Record<string, string> {
 
 export function currentTimestamp(): string {
   return now();
+}
+
+export function getDatabaseStats(): {
+    path: string;
+    sizeBytes: number;
+    accounts: number;
+    authFiles: number;
+    mailSources: number;
+    mailboxes: number;
+    jobs: number;
+    jobEvents: number;
+    integrationServices: number;
+} {
+  const database = getDb();
+  const count = (table: string) => {
+    const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {count: number};
+    return row.count;
+  };
+  const sizeBytes = existsSync(DB_PATH) ? statSync(DB_PATH).size : 0;
+  return {
+    path: DB_PATH,
+    sizeBytes,
+    accounts: count("accounts"),
+    authFiles: count("auth_files"),
+    mailSources: count("mail_sources"),
+    mailboxes: count("mailboxes"),
+    jobs: count("jobs"),
+    jobEvents: count("job_events"),
+    integrationServices: count("integration_services"),
+  };
 }

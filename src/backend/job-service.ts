@@ -1,3 +1,4 @@
+import {AsyncLocalStorage} from "node:async_hooks";
 import {EventEmitter} from "node:events";
 import {getDb, currentTimestamp, type JobEventRow, type JobRow} from "./db.js";
 
@@ -13,7 +14,19 @@ interface JobEventPayload {
 }
 
 const emitter = new EventEmitter();
-let registerJobRunning = false;
+const consoleCaptureContext = new AsyncLocalStorage<number>();
+let activeRegisterJobId: number | null = null;
+let consoleCaptureInstallCount = 0;
+let originalConsoleLog: typeof console.log | null = null;
+let originalConsoleWarn: typeof console.warn | null = null;
+let originalConsoleError: typeof console.error | null = null;
+
+export class JobCancelledError extends Error {
+  constructor(message = "任务已结束") {
+    super(message);
+    this.name = "JobCancelledError";
+  }
+}
 
 export function createJob(type: string, title: string, payload: Record<string, unknown> = {}): JobRow {
   const timestamp = currentTimestamp();
@@ -105,42 +118,100 @@ export function updateJobStatus(
   } satisfies JobEventPayload);
 }
 
+export function isJobTerminal(status: string): boolean {
+  return status === "success" || status === "failed" || status === "cancelled";
+}
+
+function getActiveRegisterJob(): JobRow | null {
+  if (!activeRegisterJobId) {
+    return null;
+  }
+  try {
+    return getJob(activeRegisterJobId);
+  } catch {
+    activeRegisterJobId = null;
+    return null;
+  }
+}
+
+export function isJobCancellationRequested(jobId: number): boolean {
+  return getJob(jobId).status === "cancelled";
+}
+
+export function throwIfJobCancelled(jobId?: number): void {
+  if (jobId && isJobCancellationRequested(jobId)) {
+    throw new JobCancelledError();
+  }
+}
+
+export function cancelJob(jobId: number): JobRow {
+  const job = getJob(jobId);
+  if (isJobTerminal(job.status)) {
+    return job;
+  }
+  updateJobStatus(jobId, "cancelled", {error: "用户结束任务"});
+  addJobEvent(jobId, "warn", "任务已请求结束");
+  emitter.emit(`job-cancel:${jobId}`);
+  return getJob(jobId);
+}
+
 export async function runJob(
   jobId: number,
   runner: () => Promise<Record<string, unknown> | void>,
   options: {exclusiveRegister?: boolean} = {},
 ): Promise<void> {
   if (options.exclusiveRegister) {
-    if (registerJobRunning) {
+    const activeRegisterJob = getActiveRegisterJob();
+    if (activeRegisterJob && !isJobTerminal(activeRegisterJob.status)) {
       updateJobStatus(jobId, "failed", {error: "已有注册任务正在执行"});
       addJobEvent(jobId, "error", "已有注册任务正在执行");
       return;
     }
-    registerJobRunning = true;
+    activeRegisterJobId = jobId;
   }
 
-  updateJobStatus(jobId, "running");
-  addJobEvent(jobId, "info", "任务开始");
   try {
+    if (isJobCancellationRequested(jobId)) {
+      addJobEvent(jobId, "warn", "任务已结束");
+      return;
+    }
+    updateJobStatus(jobId, "running");
+    addJobEvent(jobId, "info", "任务开始");
     const result = await withConsoleCapture(jobId, runner);
+    if (isJobCancellationRequested(jobId)) {
+      addJobEvent(jobId, "warn", "任务已结束");
+      return;
+    }
     updateJobStatus(jobId, "success", {result: result ?? {}});
     addJobEvent(jobId, "success", "任务完成");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    updateJobStatus(jobId, "failed", {error: message});
-    addJobEvent(jobId, "error", message);
+    if (error instanceof JobCancelledError || isJobCancellationRequested(jobId)) {
+      updateJobStatus(jobId, "cancelled", {error: message});
+      addJobEvent(jobId, "warn", message);
+    } else {
+      updateJobStatus(jobId, "failed", {error: message});
+      addJobEvent(jobId, "error", message);
+    }
   } finally {
-    if (options.exclusiveRegister) {
-      registerJobRunning = false;
+    if (options.exclusiveRegister && activeRegisterJobId === jobId) {
+      activeRegisterJobId = null;
     }
   }
 }
 
 async function withConsoleCapture<T>(jobId: number, runner: () => Promise<T>): Promise<T> {
-  const originalLog = console.log;
-  const originalWarn = console.warn;
-  const originalError = console.error;
-  const serialize = (items: unknown[]) => items.map((item) => {
+  const cleanup = installConsoleCapture();
+
+  try {
+    return await consoleCaptureContext.run(jobId, runner);
+  } finally {
+    cleanup();
+  }
+}
+
+function serializeConsoleItems(items: unknown[]): string {
+  return items.map((item) => {
     if (typeof item === "string") {
       return item;
     }
@@ -153,30 +224,52 @@ async function withConsoleCapture<T>(jobId: number, runner: () => Promise<T>): P
       return String(item);
     }
   }).join(" ");
+}
 
-  console.log = (...items: unknown[]) => {
-    addJobEvent(jobId, "info", serialize(items));
-    originalLog(...items);
-  };
-  console.warn = (...items: unknown[]) => {
-    addJobEvent(jobId, "warn", serialize(items));
-    originalWarn(...items);
-  };
-  console.error = (...items: unknown[]) => {
-    addJobEvent(jobId, "error", serialize(items));
-    originalError(...items);
-  };
-
-  try {
-    return await runner();
-  } finally {
-    console.log = originalLog;
-    console.warn = originalWarn;
-    console.error = originalError;
+function installConsoleCapture(): () => void {
+  consoleCaptureInstallCount += 1;
+  if (consoleCaptureInstallCount === 1) {
+    originalConsoleLog = console.log;
+    originalConsoleWarn = console.warn;
+    originalConsoleError = console.error;
+    console.log = (...items: unknown[]) => {
+      const jobId = consoleCaptureContext.getStore();
+      if (jobId) {
+        addJobEvent(jobId, "info", serializeConsoleItems(items));
+      }
+      originalConsoleLog?.(...items);
+    };
+    console.warn = (...items: unknown[]) => {
+      const jobId = consoleCaptureContext.getStore();
+      if (jobId) {
+        addJobEvent(jobId, "warn", serializeConsoleItems(items));
+      }
+      originalConsoleWarn?.(...items);
+    };
+    console.error = (...items: unknown[]) => {
+      const jobId = consoleCaptureContext.getStore();
+      if (jobId) {
+        addJobEvent(jobId, "error", serializeConsoleItems(items));
+      }
+      originalConsoleError?.(...items);
+    };
   }
+
+  return () => {
+    consoleCaptureInstallCount = Math.max(0, consoleCaptureInstallCount - 1);
+    if (consoleCaptureInstallCount === 0 && originalConsoleLog && originalConsoleWarn && originalConsoleError) {
+      console.log = originalConsoleLog;
+      console.warn = originalConsoleWarn;
+      console.error = originalConsoleError;
+      originalConsoleLog = null;
+      originalConsoleWarn = null;
+      originalConsoleError = null;
+    }
+  };
 }
 
 export function submitJobInput(jobId: number, value: string): void {
+  throwIfJobCancelled(jobId);
   getDb().prepare(`
         INSERT INTO job_inputs (job_id, value, created_at)
         VALUES (?, ?, ?)
@@ -186,10 +279,12 @@ export function submitJobInput(jobId: number, value: string): void {
 }
 
 export async function waitForJobInput(jobId: number, prompt: string, timeoutMs = 10 * 60 * 1000): Promise<string> {
+  throwIfJobCancelled(jobId);
   updateJobStatus(jobId, "waiting_input", {inputPrompt: prompt});
   addJobEvent(jobId, "warn", prompt);
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
+    throwIfJobCancelled(jobId);
     const row = getDb().prepare(`
             SELECT * FROM job_inputs
             WHERE job_id = ? AND consumed = 0
@@ -207,6 +302,12 @@ export async function waitForJobInput(jobId: number, prompt: string, timeoutMs =
 
 export function onJobEvent(jobId: number, listener: (event: JobEventPayload) => void): () => void {
   const key = `job:${jobId}`;
+  emitter.on(key, listener);
+  return () => emitter.off(key, listener);
+}
+
+export function onJobCancelled(jobId: number, listener: () => void): () => void {
+  const key = `job-cancel:${jobId}`;
   emitter.on(key, listener);
   return () => emitter.off(key, listener);
 }

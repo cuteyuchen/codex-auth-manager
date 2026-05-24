@@ -224,7 +224,9 @@ export interface OpenAIClientOptions {
     emailOtpProvider?: (email: string, excludeCodes: string[]) => Promise<string>;
     progressCallback?: (step: number | string, total: number, message: string) => void;
     signupScreenHint?: string;
-    smsBroker?: ISMSActivationBroker
+    smsBroker?: ISMSActivationBroker;
+    smsVerificationDisabled?: boolean;
+    shouldCancel?: () => boolean;
 }
 
 export class OpenAIClient {
@@ -243,10 +245,16 @@ export class OpenAIClient {
   state = "";
   codeVerifier = "";
   deviceID = "";
-  readonly smsBroker?: ISMSActivationBroker
+  readonly smsBroker?: ISMSActivationBroker;
+  readonly smsVerificationDisabled: boolean;
+  readonly shouldCancel?: () => boolean;
+  private readonly abortController?: AbortController;
 
   constructor(options: OpenAIClientOptions) {
     this.smsBroker = options.smsBroker;
+    this.smsVerificationDisabled = Boolean(options.smsVerificationDisabled);
+    this.shouldCancel = options.shouldCancel;
+    this.abortController = options.shouldCancel ? new AbortController() : undefined;
     this.email = options.email?.trim() ?? "";
     this.password = options.password;
     this.deviceProfile = options.deviceProfile
@@ -273,8 +281,17 @@ export class OpenAIClient {
   }
 
   private logProgress(current: number | string, total: number, message: string): void {
+    this.throwIfCancelled();
     console.log(`[${current}/${total}] ${message}`);
     this.progressCallback?.(current, total, message);
+    this.throwIfCancelled();
+  }
+
+  private throwIfCancelled(): void {
+    if (this.shouldCancel?.()) {
+      this.abortController?.abort();
+      throw new Error("任务已结束");
+    }
   }
 
   async authLoginHTTP(): Promise<AuthLoginResult> {
@@ -434,6 +451,12 @@ export class OpenAIClient {
 
     this.logProgress(step++, totalSteps, "提交注册邮箱");
     let continueURL = await this.authorizeContinueForSignup(this.signupScreenHint);
+
+    if (continueURL === `${AUTH_BASE_URL}/log-in/password`) {
+      totalSteps += 1;
+      this.logProgress(step++, totalSteps, "提交登录密码");
+      continueURL = await this.passwordVerify();
+    }
 
     if (continueURL === `${AUTH_BASE_URL}/create-account/password`) {
       totalSteps += 1;
@@ -786,6 +809,10 @@ export class OpenAIClient {
       return result;
     }
 
+    if (startURL === `${AUTH_BASE_URL}/log-in/password`) {
+      return this.finalizeAuthorizationFromContinueURL(await this.passwordVerify());
+    }
+
     const result = await this.followOAuthRedirects(startURL);
     const authRecord = await this.exchangeCodeForToken(result.code);
     result.authFile = await this.saveAuthRecord(authRecord);
@@ -819,12 +846,16 @@ export class OpenAIClient {
     }
     console.log(`autoEmailOtp: provider=${MAILBOX_CONFIG.provider} targetEmail=${this.email}`);
     const code = await getEmailVerificationCode(this.email, {excludeCodes});
-    console.log(`[emailOtp] code=${code}`);
+    console.log(`[邮箱验证码] ${this.email} code=${code}`);
     return code;
   }
 
   private async runSmsVerification(): Promise<string> {
+    this.throwIfCancelled();
     if (!this.smsBroker) {
+      if (this.smsVerificationDisabled) {
+        throw new Error("本次任务已关闭短信验证码，无法继续 add-phone 手机验证流程");
+      }
       throw new Error("未配置 SMS provider，无法进行短信验证");
     }
     const MAX_PHONES = 5;
@@ -835,6 +866,7 @@ export class OpenAIClient {
     let lastError: Error | null = null;
 
     for (let phoneIdx = 1; phoneIdx <= MAX_PHONES; phoneIdx++) {
+      this.throwIfCancelled();
       console.log(`[SMS ${phoneIdx}/${MAX_PHONES}] 从 HeroSMS 获取号码`);
       const lease = await this.smsBroker.getActivation();
       const phoneNumber = `+${lease.phoneNumber}`;
@@ -856,6 +888,7 @@ export class OpenAIClient {
       let shouldDiscardPhone = false;
 
       for (let sendIdx = 1; sendIdx <= MAX_SENDS_PER_PHONE; sendIdx += 1) {
+        this.throwIfCancelled();
         console.log(
           `[SMS ${phoneIdx}/${MAX_PHONES}] 等待短信验证码 (第 ${sendIdx} 次发送，最多 ${POLLS_PER_PHONE} 次)`,
         );
@@ -914,6 +947,7 @@ export class OpenAIClient {
 
       let rotateAfterSubmit = false;
       for (let submitIter = 1; submitIter <= MAX_SUBMIT_RETRY; submitIter++) {
+        this.throwIfCancelled();
         try {
           const nextURL = await this.validatePhone(code);
           await this.smsBroker.markAsSucceed();
@@ -924,7 +958,7 @@ export class OpenAIClient {
           );
           lastError = error as Error;
           if (submitIter < MAX_SUBMIT_RETRY) {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
+            await sleep(2000, this.shouldCancel);
           } else {
             rotateAfterSubmit = true;
           }
@@ -1481,8 +1515,15 @@ export class OpenAIClient {
   ): Promise<Response> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= FETCH_RETRY_COUNT; attempt++) {
+      this.throwIfCancelled();
       try {
-        return await baseFetch(input, init);
+        const initWithAbort = this.abortController
+          ? {
+            ...(init ?? {}),
+            signal: this.abortController.signal,
+          }
+          : init;
+        return await baseFetch(input, initWithAbort);
       } catch (error) {
         lastError = error;
         if (!isRetryableFetchError(error) || attempt >= FETCH_RETRY_COUNT) {
@@ -1492,7 +1533,7 @@ export class OpenAIClient {
           `[网络重试 ${attempt}/${FETCH_RETRY_COUNT}] ${this.describeRetryTarget(input)} ${this.describeRetryError(error)}`,
         );
         console.log(`[延迟] 网络重试等待 ${FETCH_RETRY_DELAY_MS * attempt}ms`);
-        await sleep(FETCH_RETRY_DELAY_MS * attempt);
+        await sleep(FETCH_RETRY_DELAY_MS * attempt, this.shouldCancel);
       }
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
@@ -1564,6 +1605,12 @@ function collectErrorMessages(error: unknown): string[] {
   return messages;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function sleep(ms: number, shouldCancel?: () => boolean): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < ms) {
+    if (shouldCancel?.()) {
+      throw new Error("任务已结束");
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, ms - (Date.now() - startedAt))));
+  }
 }

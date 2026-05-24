@@ -6,11 +6,14 @@ import {fetch as undiciFetch, Agent, ProxyAgent, type Dispatcher, type RequestIn
 import {appConfig} from "../core/config.js";
 import {AUTH_OAUTH_TOKEN_URLS, DEFAULT_CLIENT_ID, DEFAULT_USER_AGENT} from "../core/constants.js";
 import type {SavedAuthRecord} from "../core/openai.js";
-import {saveAuthFileJsonObjectToCLIProxyAPI} from "../core/cliproxyapi.js";
-import {uploadAuthFileToSub2API} from "../core/sub2api.js";
 import {getDb, currentTimestamp, type AccountRow, type AuthFileRow} from "./db.js";
 import {decryptSecret, encryptSecret} from "./crypto.js";
 import {buildZip, type ZipEntry} from "./zip.js";
+import {
+  resolvePushServices,
+  saveAuthFileJsonObjectToCPAService,
+  uploadAuthFileToSub2APIService,
+} from "./integration-service.js";
 
 export interface AuthRecord {
     access_token?: string;
@@ -1023,8 +1026,7 @@ export async function exportAccountsAuthZip(accountIds: number[]): Promise<{file
   };
 }
 
-export async function pushAccount(accountId: number, target: PushTarget): Promise<Record<string, unknown>> {
-  assertPushTargetConfigured(target);
+export async function pushAccount(accountId: number, target: PushTarget, serviceIds?: number[]): Promise<Record<string, unknown>> {
   const authFile = getActiveAuthFile(accountId);
   const record = await loadAuthRecord(authFile.file_path) as SavedAuthRecord;
   const fileName = authFile.file_name;
@@ -1032,25 +1034,48 @@ export async function pushAccount(accountId: number, target: PushTarget): Promis
   const timestamp = currentTimestamp();
 
   if (target === "cpa" || target === "both") {
+    const services = await resolvePushServices("cpa", serviceIds);
+    if (!services.length) {
+      assertPushTargetConfigured("cpa");
+    }
     updateAuthFileStep(accountId, "推送 CPA 中", "running");
-    await saveAuthFileJsonObjectToCLIProxyAPI(fileName, record as unknown as Record<string, unknown>);
+    const serviceResults = [];
+    for (const service of services) {
+      await saveAuthFileJsonObjectToCPAService({
+        baseUrl: service.baseUrl,
+        managementKey: service.secret,
+      }, fileName, record as unknown as Record<string, unknown>);
+      serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, status: "success"});
+    }
     getDb().prepare(`
             UPDATE auth_files
             SET last_cpa_push_at = ?, last_cpa_status = 'success', updated_at = ?
             WHERE id = ?
         `).run(timestamp, timestamp, authFile.id);
-    result.cpa = "success";
+    result.cpa = serviceResults.length ? serviceResults : "success";
   }
 
   if (target === "sub2api" || target === "both") {
+    const services = await resolvePushServices("sub2api", serviceIds);
+    if (!services.length) {
+      assertPushTargetConfigured("sub2api");
+    }
     updateAuthFileStep(accountId, "推送 Sub2API 中", "running");
-    const uploadResult = await uploadAuthFileToSub2API(fileName, record);
+    const serviceResults = [];
+    for (const service of services) {
+      const uploadResult = await uploadAuthFileToSub2APIService({
+        baseUrl: service.baseUrl,
+        adminApiKey: service.secret,
+        options: service.options,
+      }, fileName, record);
+      serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, ...uploadResult});
+    }
     getDb().prepare(`
             UPDATE auth_files
             SET last_sub2api_push_at = ?, last_sub2api_status = 'success', updated_at = ?
             WHERE id = ?
         `).run(timestamp, timestamp, authFile.id);
-    result.sub2api = uploadResult;
+    result.sub2api = serviceResults;
   }
   updateAuthFileStep(accountId, "推送完成", "success");
 
@@ -1094,5 +1119,36 @@ export function dashboardStats(): Record<string, unknown> {
   const limited = rows.filter((row) => row.status_code === "quota_exhausted" || (typeof row.remaining_percent === "number" && row.remaining_percent <= 5)).length;
   const invalid = rows.filter((row) => row.status_code === "credential_expired" || row.status_code === "account_abnormal").length;
   const remaining = rows.reduce((sum, row) => sum + (typeof row.remaining_percent === "number" ? row.remaining_percent / 100 : 0), 0);
-  return {total, ok, limited, invalid, remaining: Number(remaining.toFixed(2))};
+  const planGroups = ["free", "plus", "pro", "team"].map((plan) => {
+    const planRows = rows.filter((row) => normalizePlanGroup(row.plan) === plan);
+    const usageRows = planRows.filter((row) => typeof row.used_percent === "number" || typeof row.remaining_percent === "number");
+    const averageUsed = usageRows.length
+      ? usageRows.reduce((sum, row) => sum + (typeof row.used_percent === "number" ? row.used_percent : Math.max(0, 100 - (row.remaining_percent ?? 100))), 0) / usageRows.length
+      : null;
+    const averageRemaining = usageRows.length
+      ? usageRows.reduce((sum, row) => sum + (typeof row.remaining_percent === "number" ? row.remaining_percent : Math.max(0, 100 - (row.used_percent ?? 0))), 0) / usageRows.length
+      : null;
+    return {
+      plan,
+      count: planRows.length,
+      limited: planRows.filter((row) => row.status_code === "quota_exhausted" || (typeof row.remaining_percent === "number" && row.remaining_percent <= 5)).length,
+      averageUsed: averageUsed == null ? null : Number(averageUsed.toFixed(1)),
+      averageRemaining: averageRemaining == null ? null : Number(averageRemaining.toFixed(1)),
+    };
+  });
+  return {total, ok, limited, invalid, remaining: Number(remaining.toFixed(2)), planGroups};
+}
+
+function normalizePlanGroup(plan: string | null | undefined): "free" | "plus" | "pro" | "team" {
+  const normalized = String(plan ?? "").trim().toLowerCase();
+  if (normalized.includes("team")) {
+    return "team";
+  }
+  if (normalized.includes("pro")) {
+    return "pro";
+  }
+  if (normalized.includes("plus")) {
+    return "plus";
+  }
+  return "free";
 }

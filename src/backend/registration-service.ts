@@ -13,7 +13,14 @@ import {
 import {OpenAIClient, type SavedAuthRecord} from "../core/openai.js";
 import {createSMSBroker} from "../core/sms/index.js";
 import {getAccount, getAccountPassword, setAccountPassword, upsertAccountFromAuthRecord, loadAuthRecord, updateAuthFileStep} from "./auth-service.js";
-import {addJobEvent, waitForJobInput} from "./job-service.js";
+import {
+  JobCancelledError,
+  addJobEvent,
+  isJobCancellationRequested,
+  onJobCancelled,
+  throwIfJobCancelled,
+  waitForJobInput,
+} from "./job-service.js";
 import {getDb, currentTimestamp} from "./db.js";
 import {
   consumeReservedMailbox,
@@ -37,6 +44,7 @@ export interface RegisterOptions {
     manualOtp?: boolean;
     directSignupAuth?: boolean;
     saveAccessToken?: boolean;
+    enableSmsVerification?: boolean;
     password?: string;
     mailboxSourceId?: number;
     mailboxTypeId?: number;
@@ -44,6 +52,7 @@ export interface RegisterOptions {
     cliProvider?: MailProviderName;
     cliHotmailMode?: HotmailMode;
     uploadTarget?: UploadTarget;
+    shouldCancel?: () => boolean;
 }
 
 export interface RegisterResult {
@@ -61,6 +70,44 @@ function createBroker() {
     maxPrice: appConfig.heroSMSMaxPrice,
     country: appConfig.heroSMSCountry,
   }) : undefined;
+}
+
+function isSmsVerificationEnabled(options: RegisterOptions): boolean {
+  return options.enableSmsVerification !== false;
+}
+
+function createBrokerForRegistration(options: RegisterOptions) {
+  if (!isSmsVerificationEnabled(options)) {
+    return undefined;
+  }
+  return createBroker();
+}
+
+function shouldCancelRegistration(options: RegisterOptions): boolean {
+  return Boolean(options.shouldCancel?.() || (options.jobId && isJobCancellationRequested(options.jobId)));
+}
+
+function rethrowIfCancellation(error: unknown, options: RegisterOptions): void {
+  if (error instanceof JobCancelledError || shouldCancelRegistration(options)) {
+    throw error;
+  }
+}
+
+function logEmailOtpCode(targetEmail: string, code: string): void {
+  console.log(`[邮箱验证码] ${targetEmail} code=${code}`);
+}
+
+function createCancellationSignal(jobId?: number) {
+  let cancelled = false;
+  const off = jobId
+    ? onJobCancelled(jobId, () => {
+      cancelled = true;
+    })
+    : undefined;
+  return {
+    isCancelled: () => cancelled || Boolean(jobId && isJobCancellationRequested(jobId)),
+    dispose: () => off?.(),
+  };
 }
 
 async function recordAuthFailureEmail(email: string): Promise<void> {
@@ -134,8 +181,23 @@ function resolveRegistrationPassword(input?: string): string {
 }
 
 async function runSingleRegistration(options: RegisterOptions, email?: string): Promise<string> {
+  throwIfJobCancelled(options.jobId);
+  const cancellation = createCancellationSignal(options.jobId);
+  const scopedOptions: RegisterOptions = {
+    ...options,
+    shouldCancel: () => Boolean(options.shouldCancel?.() || cancellation.isCancelled()),
+  };
+  try {
+    return await runSingleRegistrationInner(scopedOptions, email);
+  } finally {
+    cancellation.dispose();
+  }
+}
+
+async function runSingleRegistrationInner(options: RegisterOptions, email?: string): Promise<string> {
   const password = resolveRegistrationPassword(options.password);
-  const smsBroker = createBroker();
+  const smsVerificationEnabled = isSmsVerificationEnabled(options);
+  const smsBroker = createBrokerForRegistration(options);
   const deviceProfile = generateRandomDeviceProfile();
   const databaseProvider = options.useMailboxPool && !email
     ? createDatabaseMailboxProvider(options.mailboxSourceId, options.mailboxTypeId)
@@ -143,18 +205,25 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
   const progressCallback = options.jobId
     ? (_step: number | string, _total: number, message: string) => {
       addJobEvent(options.jobId as number, "info", `凭据阶段: ${message}`);
+      throwIfJobCancelled(options.jobId);
     }
     : undefined;
+  const shouldCancel = () => shouldCancelRegistration(options);
   const emailOtpProvider = options.manualOtp && options.jobId
     ? async (targetEmail: string, excludeCodes: string[]) => {
       const code = await waitForJobInput(options.jobId as number, `请输入 ${targetEmail} 的邮箱验证码`);
       if (excludeCodes.includes(code)) {
         throw new Error(`验证码已使用过: ${code}`);
       }
+      logEmailOtpCode(targetEmail, code);
       return code;
     }
     : databaseProvider
-      ? (targetEmail: string, excludeCodes: string[]) => databaseProvider.getEmailVerificationCode(targetEmail, {excludeCodes})
+      ? async (targetEmail: string, excludeCodes: string[]) => {
+        const code = await databaseProvider.getEmailVerificationCode(targetEmail, {excludeCodes});
+        logEmailOtpCode(targetEmail, code);
+        return code;
+      }
       : undefined;
   const emailAddressProvider = databaseProvider
     ? async () => {
@@ -162,9 +231,11 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
     }
     : undefined;
   if (emailAddressProvider && !email) {
+    throwIfJobCancelled(options.jobId);
     email = await emailAddressProvider();
   }
   if (options.authOnly) {
+    throwIfJobCancelled(options.jobId);
     if (!email) {
       throw new Error("只登录授权模式必须指定邮箱");
     }
@@ -176,6 +247,8 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
       emailOtpProvider,
       progressCallback,
       smsBroker,
+      smsVerificationDisabled: !smsVerificationEnabled,
+      shouldCancel,
     });
     const result = await client.authLoginHTTP();
     console.log(`[授权成功] 邮箱：${client.email} 密码：${password} 授权文件：${result.authFile ?? ""}`);
@@ -184,6 +257,7 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
   }
 
   if (options.directSignupAuth) {
+    throwIfJobCancelled(options.jobId);
     const client = new OpenAIClient({
       email: email || undefined,
       password,
@@ -193,6 +267,8 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
       progressCallback,
       signupScreenHint: "signup",
       smsBroker,
+      smsVerificationDisabled: !smsVerificationEnabled,
+      shouldCancel,
     });
     try {
       const result = await client.authRegisterAndAuthorizeHTTP();
@@ -207,6 +283,7 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
       }
       return client.email;
     } catch (error) {
+      rethrowIfCancellation(error, options);
       await recordAuthFailureEmail(client.email);
       const mailbox = consumeReservedMailbox();
       if (mailbox) {
@@ -224,10 +301,14 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
     emailOtpProvider,
     progressCallback,
     smsBroker,
+    smsVerificationDisabled: !smsVerificationEnabled,
+    shouldCancel,
   });
   try {
+    throwIfJobCancelled(options.jobId);
     await registerClient.authRegisterHTTP();
   } catch (error) {
+    rethrowIfCancellation(error, options);
     await recordAuthFailureEmail(registerClient.email);
     const mailbox = consumeReservedMailbox();
     if (mailbox) {
@@ -237,6 +318,7 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
   }
 
   if (options.saveAccessToken) {
+    throwIfJobCancelled(options.jobId);
     const accessToken = await registerClient.getChatGPTAccessToken();
     const accessTokenFile = await registerClient.saveChatGPTAccessToken(accessToken);
     await importAuthFileFromResult(accessTokenFile, password);
@@ -257,8 +339,11 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
     progressCallback,
     emailOtpProvider,
     smsBroker,
+    smsVerificationDisabled: !smsVerificationEnabled,
+    shouldCancel,
   });
   try {
+    throwIfJobCancelled(options.jobId);
     const result = await loginClient.authLoginHTTP();
     const finalPassword = password;
     console.log(`[授权成功] 邮箱：${loginClient.email} 密码：${finalPassword} 授权文件：${result.authFile ?? ""}`);
@@ -271,6 +356,7 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
     }
     return loginClient.email;
   } catch (error) {
+    rethrowIfCancellation(error, options);
     await recordAuthFailureEmail(loginClient.email);
     const mailbox = consumeReservedMailbox();
     if (mailbox) {
@@ -318,6 +404,7 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
   const failedEmails: string[] = [];
 
   for (let index = 0; index < maxRounds; index += 1) {
+    throwIfJobCancelled(options.jobId);
     if (usesHotmailEmailQueue) {
       const remaining = await getHotmailRemainingEmailCount();
       if (remaining <= 0) {
@@ -333,6 +420,7 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
       success += 1;
       successEmails.push(registeredEmail);
     } catch (error) {
+      rethrowIfCancellation(error, options);
       failed += 1;
       const message = error instanceof Error ? error.message : String(error);
       failedEmails.push(targetEmail || "auto");
@@ -348,6 +436,16 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
   };
 }
 
+export function assertRegistrationSucceeded(result: RegisterResult): RegisterResult {
+  if (result.failed > 0) {
+    throw new Error(`注册任务失败 ${result.failed} 轮，成功 ${result.success} 轮`);
+  }
+  if (result.success <= 0) {
+    throw new Error("注册任务未成功完成任何账号");
+  }
+  return result;
+}
+
 export async function reauthorizeAccount(accountId: number, jobId?: number): Promise<{email: string; authFile?: string}> {
   const account = getAccount(accountId);
   const password = await getAccountPassword(account);
@@ -358,6 +456,7 @@ export async function reauthorizeAccount(accountId: number, jobId?: number): Pro
       if (excludeCodes.includes(code)) {
         throw new Error(`验证码已使用过: ${code}`);
       }
+      logEmailOtpCode(targetEmail, code);
       return code;
     }
     : undefined;
@@ -374,6 +473,7 @@ export async function reauthorizeAccount(accountId: number, jobId?: number): Pro
       }
       : undefined,
     smsBroker: createBroker(),
+    shouldCancel: () => jobId ? isJobCancellationRequested(jobId) : false,
   });
   const result = await client.authLoginHTTP();
   await importAuthFileFromResult(result.authFile, password);

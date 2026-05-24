@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from "vue";
 import {ElMessage} from "element-plus";
-import {Promotion, Refresh, VideoPlay} from "@element-plus/icons-vue";
-import {apiGet, apiSend, type JobEvent, type MailSource, type MailType} from "../api";
+import {CircleClose, Promotion, Refresh, VideoPlay} from "@element-plus/icons-vue";
+import {apiGet, apiSend, type Job, type JobEvent, type MailSource, type MailType} from "../api";
 
 const types = ref<MailType[]>([]);
 const sources = ref<MailSource[]>([]);
 const events = ref<JobEvent[]>([]);
 const jobId = ref<number | null>(null);
+const currentJob = ref<Job | null>(null);
 const inputValue = ref("");
 const waitingPrompt = ref("");
 const starting = ref(false);
+const cancelling = ref(false);
 let source: EventSource | null = null;
 
 const form = reactive({
@@ -21,6 +23,7 @@ const form = reactive({
   password: "",
   mode: "sign",
   manualOtp: false,
+  enableSmsVerification: true,
   cliProvider: "hotmail",
   cliHotmailMode: "graph",
   uploadTarget: "none",
@@ -48,6 +51,7 @@ const hotmailModes = [
 const emails = computed(() => form.emailText.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean));
 const filteredSources = computed(() => sources.value.filter((item) => item.enabled));
 const selectedSource = computed(() => sources.value.find((item) => String(item.id) === form.mailboxSourceId));
+const activeJob = computed(() => currentJob.value ? ["queued", "running", "waiting_input"].includes(currentJob.value.status) : false);
 const currentStage = computed(() => {
   const last = [...events.value].reverse().find((item) => item.message.includes("凭据阶段") || item.message.includes("验证码") || item.level === "success" || item.level === "error");
   return last?.message ?? "等待创建任务";
@@ -77,10 +81,32 @@ function connectStream(id: number) {
   source = new EventSource(`/api/jobs/${id}/stream`);
   source.onmessage = (message) => {
     const event = JSON.parse(message.data) as JobEvent;
+    if (event.message.startsWith("jobStatus:")) {
+      const status = event.message.slice("jobStatus:".length);
+      if (currentJob.value) {
+        currentJob.value = {
+          ...currentJob.value,
+          status,
+          waiting_for_input: status === "waiting_input" ? currentJob.value.waiting_for_input : 0,
+        };
+      }
+      if (status !== "waiting_input") {
+        waitingPrompt.value = "";
+      }
+      return;
+    }
     if (event.id > 0 && !events.value.some((item) => item.id === event.id)) {
       events.value.push(event);
       if (event.message.startsWith("请输入")) {
         waitingPrompt.value = event.message;
+        if (currentJob.value) {
+          currentJob.value = {
+            ...currentJob.value,
+            status: "waiting_input",
+            waiting_for_input: 1,
+            input_prompt: event.message,
+          };
+        }
       }
     }
   };
@@ -93,11 +119,12 @@ async function start() {
   }
   starting.value = true;
   try {
-    const result = await apiSend<{job: {id: number}}>("/api/jobs/register", "POST", {
+    const result = await apiSend<{job: Job}>("/api/jobs/register", "POST", {
       emails: emails.value,
       rounds: emails.value.length ? emails.value.length : form.rounds,
       password: form.password || undefined,
       manualOtp: form.manualOtp,
+      enableSmsVerification: form.enableSmsVerification,
       directSignupAuth: form.mode === "sign",
       authOnly: form.mode === "auth",
       saveAccessToken: form.mode === "at",
@@ -109,6 +136,7 @@ async function start() {
       title: "Web 注册任务",
     });
     jobId.value = result.job.id;
+    currentJob.value = result.job;
     waitingPrompt.value = "";
     inputValue.value = "";
     ElMessage.success(`已创建任务 #${result.job.id}`);
@@ -117,6 +145,23 @@ async function start() {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
     starting.value = false;
+  }
+}
+
+async function cancelCurrentJob() {
+  if (!currentJob.value || !activeJob.value) {
+    return;
+  }
+  cancelling.value = true;
+  try {
+    const payload = await apiSend<{job: Job}>(`/api/jobs/${currentJob.value.id}/cancel`, "POST");
+    currentJob.value = payload.job;
+    waitingPrompt.value = "";
+    ElMessage.success("已请求结束任务");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    cancelling.value = false;
   }
 }
 
@@ -247,6 +292,18 @@ onBeforeUnmount(() => source?.close());
             <el-switch v-model="form.manualOtp" active-text="手动输入邮箱验证码" />
           </el-form-item>
 
+          <el-form-item label="短信验证码">
+            <el-switch
+              v-model="form.enableSmsVerification"
+              aria-label="启用短信验证码"
+              active-text="启用短信验证码"
+              inactive-text="关闭短信验证码"
+            />
+            <div v-if="!form.enableSmsVerification" class="mt-2 text-sm text-amber-600">
+              关闭后本次任务不会调用 HeroSMS；如果 OpenAI 要求手机验证，任务会直接失败。
+            </div>
+          </el-form-item>
+
           <el-form-item label="注册成功后上传">
             <el-segmented v-model="form.uploadTarget" :options="uploadTargets" class="w-full" />
           </el-form-item>
@@ -262,7 +319,22 @@ onBeforeUnmount(() => source?.close());
             <div v-if="waitingPrompt" class="mt-2 text-sm text-amber-600">{{ waitingPrompt }}</div>
           </div>
 
-          <el-button :icon="VideoPlay" type="primary" class="w-full" :loading="starting" @click="start">开始任务</el-button>
+          <div class="grid gap-2 sm:grid-cols-2">
+            <el-button :icon="VideoPlay" type="primary" class="w-full" :loading="starting" :disabled="activeJob" @click="start">
+              开始任务
+            </el-button>
+            <el-button
+              :icon="CircleClose"
+              type="danger"
+              plain
+              class="w-full"
+              :loading="cancelling"
+              :disabled="!activeJob"
+              @click="cancelCurrentJob"
+            >
+              结束任务
+            </el-button>
+          </div>
         </el-form>
       </el-card>
 
@@ -271,7 +343,12 @@ onBeforeUnmount(() => source?.close());
           <template #header>
             <div class="flex flex-wrap items-center justify-between gap-2">
               <strong>当前阶段</strong>
-              <el-tag v-if="jobId" type="primary">#{{ jobId }}</el-tag>
+              <div v-if="jobId" class="flex items-center gap-2">
+                <el-tag type="primary">#{{ jobId }}</el-tag>
+                <el-tag v-if="currentJob" :type="activeJob ? 'warning' : currentJob.status === 'success' ? 'success' : currentJob.status === 'failed' ? 'danger' : 'info'">
+                  {{ currentJob.status }}
+                </el-tag>
+              </div>
             </div>
           </template>
           <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_280px]">
@@ -285,6 +362,9 @@ onBeforeUnmount(() => source?.close());
                 <el-tag>{{ types.length }} 类型</el-tag>
                 <el-tag type="success">{{ filteredSources.length }} 可用来源</el-tag>
                 <el-tag type="info">{{ form.useMailboxPool ? "按来源取号" : `${emails.length} 手动邮箱` }}</el-tag>
+                <el-tag :type="form.enableSmsVerification ? 'success' : 'warning'">
+                  短信{{ form.enableSmsVerification ? "启用" : "关闭" }}
+                </el-tag>
               </div>
             </div>
           </div>

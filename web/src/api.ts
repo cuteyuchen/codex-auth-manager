@@ -1,6 +1,7 @@
 export async function apiGet<T>(url: string): Promise<T> {
   const response = await fetch(url);
   if (!response.ok) {
+    handleUnauthorized(response);
     throw new Error(await readError(response));
   }
   return response.json() as Promise<T>;
@@ -15,9 +16,16 @@ export async function apiSend<T>(url: string, method: "POST" | "PUT" | "DELETE",
     body: method === "DELETE" ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
+    handleUnauthorized(response);
     throw new Error(await readError(response));
   }
   return response.json() as Promise<T>;
+}
+
+function handleUnauthorized(response: Response) {
+  if (response.status === 401 && window.location.pathname !== "/login") {
+    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+  }
 }
 
 async function readError(response: Response): Promise<string> {
@@ -187,4 +195,31 @@ export interface HeroSmsBalance {
   balance: number | null;
   currency: string;
   raw: string;
+}
+
+export type IntegrationServiceKind = "cpa" | "sub2api";
+
+export interface IntegrationService {
+  id: number;
+  kind: IntegrationServiceKind;
+  name: string;
+  baseUrl: string;
+  secret: {
+    hasValue: boolean;
+    tail: string;
+  };
+  enabled: boolean;
+  priority: number;
+  includeProxyUrl: boolean;
+  options: Record<string, unknown>;
+  lastTestAt: string | null;
+  lastTestStatus: string | null;
+  lastTestMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SessionState {
+  passwordEnabled: boolean;
+  authenticated: boolean;
 }

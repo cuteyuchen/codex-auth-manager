@@ -7,7 +7,7 @@ import {
   Refresh,
   Search,
 } from "@element-plus/icons-vue";
-import {apiGet, apiSend, type Account, type UsageWindow} from "../api";
+import {apiGet, apiSend, type Account, type IntegrationService, type UsageWindow} from "../api";
 
 const router = useRouter();
 const accounts = ref<Account[]>([]);
@@ -24,6 +24,8 @@ const activeAccount = ref<Account | null>(null);
 const passwordValue = ref("");
 const pushTarget = ref<"cpa" | "sub2api" | "both">("cpa");
 const pushScope = ref<"single" | "bulk">("single");
+const services = ref<IntegrationService[]>([]);
+const selectedServiceIds = ref<number[]>([]);
 let timer: number | undefined;
 
 const filters = reactive({
@@ -58,6 +60,12 @@ const pushTargets = [
 
 const selectedIds = computed(() => selected.value.map((item) => item.id));
 const pagedAccounts = computed(() => accounts.value.slice((currentPage.value - 1) * pageSize.value, currentPage.value * pageSize.value));
+const availablePushServices = computed(() => services.value.filter((service) => {
+  if (!service.enabled) {
+    return false;
+  }
+  return pushTarget.value === "both" || service.kind === pushTarget.value;
+}));
 
 function buildQuery() {
   const params = new URLSearchParams();
@@ -85,6 +93,15 @@ async function load(silent = false) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
     loading.value = false;
+  }
+}
+
+async function loadServices() {
+  try {
+    const payload = await apiGet<{services: IntegrationService[]}>("/api/integration-services");
+    services.value = payload.services;
+  } catch {
+    services.value = [];
   }
 }
 
@@ -173,7 +190,12 @@ async function downloadAuth(ids: number[]) {
   }
 }
 
-async function single(id: number, action: "check" | "refresh" | "reauth" | "push", target: "cpa" | "sub2api" | "both" = "both") {
+async function single(
+  id: number,
+  action: "check" | "refresh" | "reauth" | "push",
+  target: "cpa" | "sub2api" | "both" = "both",
+  serviceIds?: number[],
+) {
   try {
     if (action === "check") {
       await apiSend(`/api/accounts/${id}/check`, "POST");
@@ -185,7 +207,7 @@ async function single(id: number, action: "check" | "refresh" | "reauth" | "push
       const result = await apiSend<{job: {id: number}}>(`/api/accounts/${id}/reauth`, "POST");
       ElMessage.success(`已创建重新授权任务 #${result.job.id}`);
     } else {
-      await apiSend(`/api/accounts/${id}/push`, "POST", {target});
+      await apiSend(`/api/accounts/${id}/push`, "POST", {target, serviceIds});
       ElMessage.success("推送完成");
     }
     await load(true);
@@ -194,7 +216,11 @@ async function single(id: number, action: "check" | "refresh" | "reauth" | "push
   }
 }
 
-async function bulk(action: "check" | "refresh" | "reauth" | "push", target: "cpa" | "sub2api" | "both" = "both") {
+async function bulk(
+  action: "check" | "refresh" | "reauth" | "push",
+  target: "cpa" | "sub2api" | "both" = "both",
+  serviceIds?: number[],
+) {
   if (!selectedIds.value.length) {
     ElMessage.warning("请先选择账号");
     return;
@@ -203,6 +229,7 @@ async function bulk(action: "check" | "refresh" | "reauth" | "push", target: "cp
     const result = await apiSend<{job: {id: number}}>(`/api/accounts/bulk/${action}`, "POST", {
       ids: selectedIds.value,
       target,
+      serviceIds,
     });
     ElMessage.success(`已创建批量任务 #${result.job.id}`);
     await router.push("/jobs");
@@ -224,7 +251,9 @@ function openPush(row?: Account) {
     pushScope.value = "bulk";
   }
   pushTarget.value = "cpa";
+  selectedServiceIds.value = [];
   pushDialog.value = true;
+  void loadServices();
 }
 
 async function confirmPush() {
@@ -232,9 +261,9 @@ async function confirmPush() {
     if (!activeAccount.value) {
       return;
     }
-    await single(activeAccount.value.id, "push", pushTarget.value);
+    await single(activeAccount.value.id, "push", pushTarget.value, selectedServiceIds.value);
   } else {
-    await bulk("push", pushTarget.value);
+    await bulk("push", pushTarget.value, selectedServiceIds.value);
   }
   pushDialog.value = false;
 }
@@ -326,7 +355,12 @@ function schedulePoll() {
 
 onMounted(async () => {
   await load(true);
+  await loadServices();
   schedulePoll();
+});
+
+watch(pushTarget, () => {
+  selectedServiceIds.value = selectedServiceIds.value.filter((id) => availablePushServices.value.some((service) => service.id === id));
 });
 
 onBeforeUnmount(() => {
@@ -496,7 +530,7 @@ watch(pageSize, () => {
 
     <el-dialog v-model="pushDialog" title="选择推送平台" width="440px">
       <el-alert
-        title="如果对应平台没有在配置页填写 Base URL 和密钥，推送会被拦截并提示需要配置。"
+        title="不选择具体服务时，会按启用服务优先级推送；若没有服务，则回退到配置页的单组 CPA/Sub2API 配置。"
         type="info"
         show-icon
         class="mb-4"
@@ -506,6 +540,27 @@ watch(pageSize, () => {
           {{ target.label }}
         </el-radio-button>
       </el-radio-group>
+      <div class="mt-4">
+        <div class="mb-2 text-sm font-semibold text-[var(--app-text)]">指定服务</div>
+        <el-select
+          v-model="selectedServiceIds"
+          multiple
+          clearable
+          filterable
+          class="w-full"
+          placeholder="留空使用全部启用服务"
+        >
+          <el-option
+            v-for="service in availablePushServices"
+            :key="service.id"
+            :label="`${service.kind === 'cpa' ? 'CPA' : 'Sub2API'} / ${service.name}`"
+            :value="service.id"
+          />
+        </el-select>
+        <div class="mt-2 text-xs text-[var(--app-muted)]">
+          当前将推送 {{ pushScope === "single" ? 1 : selectedIds.length }} 个账号。
+        </div>
+      </div>
       <template #footer>
         <el-button @click="pushDialog = false">取消</el-button>
         <el-button type="primary" @click="confirmPush">

@@ -1,5 +1,5 @@
 import path from "node:path";
-import {existsSync} from "node:fs";
+import {createReadStream, existsSync} from "node:fs";
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import {getConfigForUi, updateConfigFromUi} from "./config-service.js";
@@ -20,6 +20,7 @@ import {
 import {getSchedulerConfig, startScheduler, updateSchedulerConfig} from "./scheduler.js";
 import {
   createJob,
+  cancelJob,
   getJob,
   listJobEvents,
   listJobs,
@@ -27,7 +28,12 @@ import {
   runJob,
   submitJobInput,
 } from "./job-service.js";
-import {reauthorizeAccount, runRegistrationJob, type RegisterOptions} from "./registration-service.js";
+import {
+  assertRegistrationSucceeded,
+  reauthorizeAccount,
+  runRegistrationJob,
+  type RegisterOptions,
+} from "./registration-service.js";
 import {
   createMailbox,
   createMailType,
@@ -47,8 +53,26 @@ import {
   updateMailSource,
 } from "./mailbox-service.js";
 import {getHeroSmsBalance, getHeroSmsCountries, getHeroSmsPrices} from "./hero-sms-service.js";
+import {testProxyConnection} from "./proxy-test-service.js";
+import {
+  createIntegrationService,
+  deleteIntegrationService,
+  listIntegrationServices,
+  testIntegrationService,
+  updateIntegrationService,
+} from "./integration-service.js";
+import {backupDatabase, cleanupJobs, getSystemDatabaseInfo} from "./system-service.js";
+import {
+  assertHostAccessAllowed,
+  getSessionState,
+  isAuthenticated,
+  login,
+  logout,
+} from "./session-service.js";
+import {appConfig} from "../core/config.js";
+import {getDb} from "./db.js";
 
-const HOST = "127.0.0.1";
+const HOST = process.env.CODEX_REGISTER_WEB_HOST || "127.0.0.1";
 const PORT = Number.parseInt(process.env.CODEX_REGISTER_WEB_PORT ?? "3789", 10) || 3789;
 const WEB_DIST = path.resolve(process.cwd(), "web", "dist");
 
@@ -73,18 +97,69 @@ app.setErrorHandler((error, _request, reply) => {
   reply.code(500).send({error: message});
 });
 
+app.addHook("preHandler", async (request, reply) => {
+  const url = request.raw.url ?? "";
+  const publicApi =
+    url.startsWith("/api/health") ||
+    url.startsWith("/api/session");
+  if (url.startsWith("/api/") && !publicApi && !isAuthenticated(request)) {
+    reply.code(401);
+    return {error: "请先登录"};
+  }
+  return undefined;
+});
+
 app.get("/api/health", async () => ({ok: true}));
+app.get("/api/session", async (request) => getSessionState(request));
+app.post("/api/session/login", async (request, reply) => {
+  const body = request.body as {password?: string} | undefined;
+  return login(String(body?.password ?? ""), reply);
+});
+app.post("/api/session/logout", async (_request, reply) => logout(reply));
 
 app.get("/api/config", async () => getConfigForUi());
 app.put("/api/config", async (request) => {
   return updateConfigFromUi((request.body ?? {}) as Record<string, unknown>);
 });
+app.post("/api/config/proxy-test", async (request) => {
+  return testProxyConnection((request.body ?? {}) as {proxyUrl?: unknown; targetUrl?: unknown});
+});
 
-app.get("/api/dashboard", async () => ({
-  stats: dashboardStats(),
-  scheduler: getSchedulerConfig(),
-  jobs: listJobs(8),
-}));
+app.get("/api/dashboard", async () => {
+  const mailboxes = getDb().prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN used = 0 AND status = 'unused' THEN 1 ELSE 0 END) AS unused,
+      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+    FROM mailboxes
+  `).get() as {total: number; unused: number | null; failed: number | null};
+  const sources = getDb().prepare("SELECT COUNT(*) AS count FROM mail_sources WHERE enabled = 1").get() as {count: number};
+  const services = getDb().prepare(`
+    SELECT kind, COUNT(*) AS count
+    FROM integration_services
+    WHERE enabled = 1
+    GROUP BY kind
+  `).all() as Array<{kind: string; count: number}>;
+  return {
+    stats: dashboardStats(),
+    scheduler: getSchedulerConfig(),
+    jobs: listJobs(8),
+    mailboxes: {
+      total: mailboxes.total,
+      unused: mailboxes.unused ?? 0,
+      failed: mailboxes.failed ?? 0,
+      sources: sources.count,
+    },
+    services: {
+      cpa: services.find((item) => item.kind === "cpa")?.count ?? 0,
+      sub2api: services.find((item) => item.kind === "sub2api")?.count ?? 0,
+    },
+    heroSms: {
+      configured: Boolean(appConfig.heroSMSApiKey),
+      country: appConfig.heroSMSCountry,
+    },
+  };
+});
 
 app.get("/api/accounts", async (request) => {
   const query = (request.query as Record<string, string> | undefined) ?? {};
@@ -149,13 +224,13 @@ app.post("/api/accounts/:id/reauth", async (request) => {
 
 app.post("/api/accounts/:id/push", async (request) => {
   const id = Number((request.params as {id: string}).id);
-  const body = request.body as {target?: PushTarget} | undefined;
-  return pushAccount(id, body?.target ?? "both");
+  const body = request.body as {target?: PushTarget; serviceIds?: number[]} | undefined;
+  return pushAccount(id, body?.target ?? "both", body?.serviceIds);
 });
 
 app.post("/api/accounts/bulk/:action", async (request) => {
   const action = (request.params as {action: string}).action;
-  const body = request.body as {ids?: number[]; target?: PushTarget} | undefined;
+  const body = request.body as {ids?: number[]; target?: PushTarget; serviceIds?: number[]} | undefined;
   const ids = Array.isArray(body?.ids) ? body.ids.map(Number).filter(Number.isFinite) : [];
   const job = createJob(`bulk_${action}`, `批量${action}`, {ids, target: body?.target});
   void runJob(job.id, async () => {
@@ -171,7 +246,7 @@ app.post("/api/accounts/bulk/:action", async (request) => {
         return {id, result: await reauthorizeAccount(id, job.id)};
       }
       if (action === "push") {
-        return {id, result: await pushAccount(id, body?.target ?? "both")};
+        return {id, result: await pushAccount(id, body?.target ?? "both", body?.serviceIds)};
       }
       throw new Error(`不支持的批量操作: ${action}`);
     });
@@ -183,7 +258,10 @@ app.post("/api/accounts/bulk/:action", async (request) => {
 app.post("/api/jobs/register", async (request) => {
   const body = (request.body ?? {}) as RegisterOptions & {title?: string};
   const job = createJob("register", body.title || "注册/授权任务", body as Record<string, unknown>);
-  void runJob(job.id, async () => ({...(await runRegistrationJob({...body, jobId: job.id}))}), {exclusiveRegister: true});
+  void runJob(job.id, async () => {
+    const result = await runRegistrationJob({...body, jobId: job.id});
+    return {...assertRegistrationSucceeded(result)};
+  }, {exclusiveRegister: true});
   return {job};
 });
 
@@ -262,6 +340,11 @@ app.post("/api/jobs/:id/input", async (request) => {
   return {ok: true};
 });
 
+app.post("/api/jobs/:id/cancel", async (request) => {
+  const id = Number((request.params as {id: string}).id);
+  return {job: cancelJob(id)};
+});
+
 app.get("/api/jobs/:id/stream", async (request, reply) => {
   const id = Number((request.params as {id: string}).id);
   reply.raw.writeHead(200, {
@@ -280,6 +363,29 @@ app.get("/api/jobs/:id/stream", async (request, reply) => {
 
 app.get("/api/scheduler", async () => getSchedulerConfig());
 app.put("/api/scheduler", async (request) => updateSchedulerConfig((request.body ?? {}) as {enabled?: boolean; dailyTime?: string}));
+
+app.get("/api/integration-services", async (request) => {
+  const query = (request.query as {kind?: string} | undefined) ?? {};
+  return {services: await listIntegrationServices(query.kind)};
+});
+app.post("/api/integration-services", async (request) => ({
+  service: await createIntegrationService((request.body ?? {}) as Record<string, unknown>),
+}));
+app.put("/api/integration-services/:id", async (request) => ({
+  service: await updateIntegrationService(Number((request.params as {id: string}).id), (request.body ?? {}) as Record<string, unknown>),
+}));
+app.delete("/api/integration-services/:id", async (request) => deleteIntegrationService(Number((request.params as {id: string}).id)));
+app.post("/api/integration-services/:id/test", async (request) => testIntegrationService(Number((request.params as {id: string}).id)));
+
+app.get("/api/system/database", async () => getSystemDatabaseInfo());
+app.post("/api/system/database/backup", async (_request, reply) => {
+  const backup = await backupDatabase();
+  return reply
+    .type("application/octet-stream")
+    .header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(backup.fileName)}`)
+    .send(createReadStream(backup.filePath));
+});
+app.post("/api/system/jobs/cleanup", async (request) => cleanupJobs((request.body ?? {}) as {before?: string; keepLatest?: number}));
 
 async function registerStatic(): Promise<void> {
   if (existsSync(path.join(WEB_DIST, "index.html"))) {
@@ -303,6 +409,7 @@ async function registerStatic(): Promise<void> {
 }
 
 export async function startServer(): Promise<void> {
+  assertHostAccessAllowed(HOST);
   await registerStatic();
   startScheduler();
   await app.listen({host: HOST, port: PORT});
