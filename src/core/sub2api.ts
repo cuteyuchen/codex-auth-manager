@@ -130,9 +130,9 @@ export async function uploadAuthFileToSub2API(
   const response = await fetch(buildImportUrl(baseUrl), {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${adminApiKey}`,
       Accept: "application/json",
       "Content-Type": "application/json",
+      "x-api-key": adminApiKey,
     },
     body: JSON.stringify(buildCodexSessionImportPayload(fileName, record)),
   });

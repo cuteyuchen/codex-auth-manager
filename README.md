@@ -264,7 +264,7 @@ CPA 需要：
 Sub2API 需要：
 
 - `sub2apiBaseUrl`
-- `sub2apiAdminApiKey`
+- `sub2apiAdminApiKey`，请求时通过 `x-api-key: <your-admin-api-key>` 发送
 - 可选：`sub2apiGroupIds`、`sub2apiProxyId`、`sub2apiConcurrency`、`sub2apiPriority`、`sub2apiRateMultiplier`、`sub2apiLoadFactor`
 
 ## 代理策略
