@@ -178,6 +178,7 @@ app.get("/api/accounts", async (request) => {
     provider: query.provider,
     plan: query.plan,
     autoReauth: query.autoReauth,
+    pushStatus: query.pushStatus,
     page: Number(query.page ?? 1),
     pageSize: Number(query.pageSize ?? 200),
   })};

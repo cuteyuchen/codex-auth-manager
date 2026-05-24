@@ -865,6 +865,7 @@ export interface AccountFilters {
     provider?: string;
     plan?: string;
     autoReauth?: string;
+    pushStatus?: string;
     page?: number;
     pageSize?: number;
 }
@@ -922,7 +923,11 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
           AND (@provider = '' OR COALESCE(a.provider, '') = @provider)
           AND (@plan = '' OR COALESCE(a.plan, '') = @plan)
           AND (@autoReauth = '' OR a.auto_reauth = CASE WHEN @autoReauth = 'true' THEN 1 ELSE 0 END)
-        ORDER BY a.updated_at DESC, a.id DESC
+          AND (
+            @pushStatus = ''
+            OR (@pushStatus = 'not_pushed' AND af.id IS NOT NULL AND af.last_cpa_push_at IS NULL AND af.last_sub2api_push_at IS NULL)
+          )
+        ORDER BY a.created_at DESC, a.id DESC
         LIMIT @limit OFFSET @offset
     `).all({
     query: String(normalized.q ?? "").trim(),
@@ -932,6 +937,7 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
     provider: String(normalized.provider ?? "").trim(),
     plan: String(normalized.plan ?? "").trim(),
     autoReauth: String(normalized.autoReauth ?? "").trim(),
+    pushStatus: String(normalized.pushStatus ?? "").trim(),
     limit: Math.min(500, Math.max(1, Number(normalized.pageSize ?? 200) || 200)),
     offset: Math.max(0, ((Number(normalized.page ?? 1) || 1) - 1) * (Number(normalized.pageSize ?? 200) || 200)),
   }) as AccountListItem[];

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from "vue";
+import {computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch} from "vue";
 import {ElMessage} from "element-plus";
 import {CircleClose, Promotion, Refresh, VideoPlay} from "@element-plus/icons-vue";
 import {apiGet, apiSend, type Job, type JobEvent, type MailSource, type MailType} from "../api";
@@ -13,6 +13,8 @@ const inputValue = ref("");
 const waitingPrompt = ref("");
 const starting = ref(false);
 const cancelling = ref(false);
+const logBoxRef = ref<HTMLElement | null>(null);
+const stickToLatestLog = ref(true);
 let source: EventSource | null = null;
 
 const form = reactive({
@@ -29,10 +31,18 @@ const form = reactive({
   uploadTarget: "none",
 });
 
+const stats = reactive({
+  total: 0,
+  completed: 0,
+  success: 0,
+  failed: 0,
+  smsNumbersUsed: 0,
+  smsActivationsCompleted: 0,
+});
+
 const registerModes = [
   {label: "注册并授权", value: "sign"},
   {label: "只登录授权", value: "auth"},
-  {label: "注册后授权", value: "normal"},
   {label: "只保存 accessToken", value: "at"},
 ];
 
@@ -57,6 +67,69 @@ const currentStage = computed(() => {
   return last?.message ?? "等待创建任务";
 });
 
+function resetStats() {
+  Object.assign(stats, {
+    total: 0,
+    completed: 0,
+    success: 0,
+    failed: 0,
+    smsNumbersUsed: 0,
+    smsActivationsCompleted: 0,
+  });
+}
+
+function updateStatsFromEvent(message: string) {
+  const match = message.match(/总轮数\s+(\d+)，已完成\s+(\d+)，成功\s+(\d+)，失败\s+(\d+)，短信使用号码\s+(\d+)，短信成功激活\s+(\d+)/);
+  if (!match) {
+    return;
+  }
+  stats.total = Number(match[1]);
+  stats.completed = Number(match[2]);
+  stats.success = Number(match[3]);
+  stats.failed = Number(match[4]);
+  stats.smsNumbersUsed = Number(match[5]);
+  stats.smsActivationsCompleted = Number(match[6]);
+}
+
+function updateLogStickiness() {
+  const element = logBoxRef.value;
+  if (!element) {
+    stickToLatestLog.value = true;
+    return;
+  }
+  stickToLatestLog.value = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+}
+
+function scrollLogToBottom() {
+  const element = logBoxRef.value;
+  if (element) {
+    element.scrollTop = element.scrollHeight;
+  }
+}
+
+function appendEvent(event: JobEvent) {
+  if (events.value.some((item) => item.id === event.id)) {
+    return;
+  }
+  const shouldFollow = stickToLatestLog.value;
+  updateStatsFromEvent(event.message);
+  events.value.push(event);
+  if (event.message.startsWith("请输入")) {
+    waitingPrompt.value = event.message;
+    if (currentJob.value) {
+      currentJob.value = {
+        ...currentJob.value,
+        status: "waiting_input",
+        waiting_for_input: 1,
+        input_prompt: event.message,
+      };
+    }
+  }
+  if (shouldFollow) {
+    void nextTick(scrollLogToBottom);
+  }
+}
+
 async function loadMeta() {
   try {
     const [typePayload, sourcePayload] = await Promise.all([
@@ -78,6 +151,7 @@ function connectStream(id: number) {
     source.close();
   }
   events.value = [];
+  resetStats();
   source = new EventSource(`/api/jobs/${id}/stream`);
   source.onmessage = (message) => {
     const event = JSON.parse(message.data) as JobEvent;
@@ -95,19 +169,8 @@ function connectStream(id: number) {
       }
       return;
     }
-    if (event.id > 0 && !events.value.some((item) => item.id === event.id)) {
-      events.value.push(event);
-      if (event.message.startsWith("请输入")) {
-        waitingPrompt.value = event.message;
-        if (currentJob.value) {
-          currentJob.value = {
-            ...currentJob.value,
-            status: "waiting_input",
-            waiting_for_input: 1,
-            input_prompt: event.message,
-          };
-        }
-      }
+    if (event.id > 0) {
+      appendEvent(event);
     }
   };
 }
@@ -119,6 +182,7 @@ async function start() {
   }
   starting.value = true;
   try {
+    resetStats();
     const result = await apiSend<{job: Job}>("/api/jobs/register", "POST", {
       emails: emails.value,
       rounds: emails.value.length ? emails.value.length : form.rounds,
@@ -368,6 +432,28 @@ onBeforeUnmount(() => source?.close());
               </div>
             </div>
           </div>
+          <div class="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">进度</div>
+              <div class="mt-1 text-lg font-semibold">{{ stats.completed }} / {{ stats.total || "-" }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">成功</div>
+              <div class="mt-1 text-lg font-semibold text-emerald-600">{{ stats.success }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">失败</div>
+              <div class="mt-1 text-lg font-semibold text-rose-600">{{ stats.failed }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">短信号码</div>
+              <div class="mt-1 text-lg font-semibold">{{ stats.smsNumbersUsed }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">短信成功</div>
+              <div class="mt-1 text-lg font-semibold">{{ stats.smsActivationsCompleted }}</div>
+            </div>
+          </div>
         </el-card>
 
         <el-card shadow="never">
@@ -377,7 +463,7 @@ onBeforeUnmount(() => source?.close());
               <el-tag v-if="events.length" effect="plain">{{ events.length }} 条</el-tag>
             </div>
           </template>
-          <div class="log-box">
+          <div ref="logBoxRef" class="log-box" @scroll="updateLogStickiness">
             <div v-for="event in events" :key="event.id" class="log-line" :class="event.level">
               [{{ event.created_at }}] {{ event.level }} {{ event.message }}
             </div>

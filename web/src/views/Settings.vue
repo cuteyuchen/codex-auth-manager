@@ -27,6 +27,13 @@ const proxyTestResult = ref<{
   message: string;
 } | null>(null);
 
+const loopDelaySeconds = computed({
+  get: () => Math.max(0, Math.round(Number(config.loopDelayMs ?? 0) / 1000)),
+  set: (value: number) => {
+    config.loopDelayMs = Math.max(0, Number(value) || 0) * 1000;
+  },
+});
+
 const secretKeys = [
   "defaultPassword",
   "gmailAccessToken",
@@ -281,7 +288,7 @@ onMounted(load);
                 </el-form-item>
               </el-col>
               <el-col :span="12">
-                <el-form-item label="循环间隔 ms"><el-input-number v-model="config.loopDelayMs" :min="1000" class="w-full" /></el-form-item>
+                <el-form-item label="循环间隔 s"><el-input-number v-model="loopDelaySeconds" :min="0" class="w-full" /></el-form-item>
               </el-col>
             </el-row>
           </el-form>

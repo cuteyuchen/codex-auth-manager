@@ -58,6 +58,7 @@ const filters = reactive({
   provider: "",
   plan: "",
   autoReauth: "",
+  pushStatus: "",
 });
 
 const statusOptions = [
@@ -197,6 +198,7 @@ function resetFilters() {
     provider: "",
     plan: "",
     autoReauth: "",
+    pushStatus: "",
   });
   currentPage.value = 1;
   void load(false, true);
@@ -616,6 +618,11 @@ watch(currentPage, () => {
             <el-select v-model="filters.autoReauth" clearable placeholder="全部" class="w-full">
               <el-option label="开启" value="true"/>
               <el-option label="关闭" value="false"/>
+            </el-select>
+          </el-form-item>
+          <el-form-item label="推送">
+            <el-select v-model="filters.pushStatus" clearable placeholder="全部" class="w-full">
+              <el-option label="未推送" value="not_pushed"/>
             </el-select>
           </el-form-item>
           <el-form-item>
