@@ -150,7 +150,7 @@ function findExistingAccountId(record: SavedAuthRecord): number | undefined {
   if (!email) {
     return undefined;
   }
-  const row = getDb().prepare("SELECT id FROM accounts WHERE email = ?").get(email) as {id: number} | undefined;
+  const row = getDb().prepare("SELECT id FROM accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))").get(email) as {id: number} | undefined;
   return row?.id;
 }
 
@@ -179,13 +179,13 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
   }
   const existingPlatformAuth = findExistingPlatformAuth(credential);
   const existingAccountId = findExistingAccountId(credential.record);
+  const targetAccountId = existingAccountId ?? existingPlatformAuth?.accountId;
   const filePath = await savePlatformAuthFile(credential, existingPlatformAuth?.filePath);
-  const existed = isExistingAuthFile(filePath);
-  if (existingPlatformAuth) {
-    const localEmail = getAccountEmail(existingPlatformAuth.accountId);
+  if (targetAccountId) {
+    const localEmail = getAccountEmail(targetAccountId);
     const record = localEmail ? {...credential.record, email: localEmail} : credential.record;
     await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-    upsertAuthFile(existingPlatformAuth.accountId, filePath, record, {
+    upsertAuthFile(targetAccountId, filePath, record, {
       sourceKind: credential.service.kind,
       sourceName: credential.service.name,
       sourceServiceId: credential.service.id ?? null,
@@ -194,10 +194,10 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
       activate: false,
     });
     if (credential.service.id) {
-      ensureAccountPlatformBinding(existingPlatformAuth.accountId, credential.service.id);
+      ensureAccountPlatformBinding(targetAccountId, credential.service.id);
     }
-    resolveActivePlatformCredential(existingPlatformAuth.accountId);
-    return {accountId: existingPlatformAuth.accountId, action: "updated"};
+    resolveActivePlatformCredential(targetAccountId);
+    return {accountId: targetAccountId, action: "updated"};
   }
   const account = await upsertAccountFromAuthRecord(credential.record, filePath, {
     sourceKind: credential.service.kind,
@@ -212,7 +212,7 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
     ensureAccountPlatformBinding(account.id, credential.service.id);
   }
   resolveActivePlatformCredential(account.id);
-  return {accountId: account.id, action: existed || existingAccountId ? "updated" : "imported"};
+  return {accountId: account.id, action: "imported"};
 }
 
 export function resolveActivePlatformCredential(accountId: number): void {
@@ -225,12 +225,9 @@ export function resolveActivePlatformCredential(accountId: number): void {
       af.credential_source_remote_id,
       af.credential_synced_at
     FROM auth_files af
-    LEFT JOIN integration_services s ON s.id = af.credential_source_service_id
     WHERE af.account_id = ?
     ORDER BY
-      CASE WHEN af.credential_source_kind IN ('cpa', 'sub2api') THEN 0 ELSE 1 END ASC,
-      COALESCE(s.priority, 999999) ASC,
-      COALESCE(s.id, 999999) ASC,
+      COALESCE(af.credential_synced_at, af.updated_at, af.created_at) DESC,
       af.id DESC
     LIMIT 1
   `).get(accountId) as {

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from "vue";
 import {useRouter} from "vue-router";
-import {ElMessage} from "element-plus";
+import {ElMessage, ElMessageBox} from "element-plus";
 import {
+  CopyDocument,
   Download,
   Refresh,
   Search,
@@ -14,7 +15,8 @@ import {
   type Account,
   type BoundPlatformService,
   type IntegrationService,
-  type IntegrationServiceKind,
+  type Job,
+  type JobEvent,
   type MailSource,
   type UsageWindow
 } from "../api";
@@ -40,7 +42,6 @@ const clearPassword = ref(false);
 const accountSourceId = ref<number | null>(null);
 const pushTarget = ref<"cpa" | "sub2api" | "both">("cpa");
 const pushScope = ref<"single" | "bulk">("single");
-const syncSource = ref<IntegrationServiceKind | "all">("all");
 const syncCheckAfter = ref(true);
 const bindingScope = ref<"single" | "bulk">("single");
 const bindingMode = ref<"replace" | "append" | "clear">("replace");
@@ -48,6 +49,27 @@ const services = ref<IntegrationService[]>([]);
 const selectedServiceIds = ref<number[]>([]);
 const selectedSyncServiceIds = ref<number[]>([]);
 const selectedBindingServiceIds = ref<number[]>([]);
+const bindingFilterServiceIds = ref<number[]>([]);
+
+const reauthDialog = ref(false);
+const reauthMode = ref<"auto" | "manual">("auto");
+const reauthAccount = ref<Account | null>(null);
+const reauthJob = ref<Job | null>(null);
+const reauthEvents = ref<JobEvent[]>([]);
+const reauthAuthUrl = ref<string>("");
+const reauthCallbackInput = ref<string>("");
+const reauthSubmittingCallback = ref(false);
+const reauthFinalized = ref(false);
+let reauthEventSource: EventSource | null = null;
+let reauthLastEventId = 0;
+
+const syncJob = ref<Job | null>(null);
+const syncEvents = ref<JobEvent[]>([]);
+const syncFinalized = ref(false);
+const syncSummary = ref<Record<string, unknown> | null>(null);
+let syncEventSource: EventSource | null = null;
+let syncLastEventId = 0;
+
 let timer: number | undefined;
 let pendingAutoCheck = false;
 
@@ -55,7 +77,6 @@ const filters = reactive({
   q: "",
   status: "",
   credentialType: "",
-  provider: "",
   plan: "",
   autoReauth: "",
   pushStatus: "",
@@ -66,6 +87,7 @@ const statusOptions = [
   {label: "额度已用尽", value: "quota_exhausted", type: "warning"},
   {label: "凭据过期", value: "credential_expired", type: "danger"},
   {label: "账号异常", value: "account_abnormal", type: "danger"},
+  {label: "需要人工重登", value: "needs_manual_reauth", type: "danger"},
   {label: "未检查", value: "unchecked", type: "info"},
   {label: "只保存 accessToken", value: "access_token_only", type: "primary"},
 ];
@@ -85,17 +107,12 @@ const pushTargets = [
 const selectedIds = computed(() => selected.value.map((item) => item.id));
 const pagedAccounts = computed(() => accounts.value.slice((currentPage.value - 1) * pageSize.value, currentPage.value * pageSize.value));
 const pagedAccountIds = computed(() => pagedAccounts.value.map((item) => item.id));
+const enabledServices = computed(() => services.value.filter((service) => service.enabled));
 const availablePushServices = computed(() => services.value.filter((service) => {
   if (!service.enabled) {
     return false;
   }
   return pushTarget.value === "both" || service.kind === pushTarget.value;
-}));
-const availableSyncServices = computed(() => services.value.filter((service) => {
-  if (!service.enabled) {
-    return false;
-  }
-  return syncSource.value === "all" || service.kind === syncSource.value;
 }));
 
 function buildQuery() {
@@ -104,6 +121,9 @@ function buildQuery() {
     if (value !== "") {
       params.set(key, value);
     }
+  }
+  if (bindingFilterServiceIds.value.length) {
+    params.set("bindingServiceIds", bindingFilterServiceIds.value.join(","));
   }
   params.set("pageSize", "300");
   return params.toString();
@@ -195,11 +215,11 @@ function resetFilters() {
     q: "",
     status: "",
     credentialType: "",
-    provider: "",
     plan: "",
     autoReauth: "",
     pushStatus: "",
   });
+  bindingFilterServiceIds.value = [];
   currentPage.value = 1;
   void load(false, true);
 }
@@ -218,26 +238,112 @@ async function importAuth() {
 }
 
 function openSync() {
-  syncSource.value = "all";
   syncCheckAfter.value = true;
   selectedSyncServiceIds.value = [];
+  syncEvents.value = [];
+  syncJob.value = null;
+  syncSummary.value = null;
+  syncFinalized.value = false;
+  closeSyncEventSource();
   syncDialog.value = true;
   void loadServices();
 }
 
 async function confirmSync() {
   try {
-    const result = await apiSend<{ job: { id: number } }>("/api/accounts/sync-platforms", "POST", {
-      source: syncSource.value,
-      serviceIds: selectedSyncServiceIds.value,
+    const ids = selectedSyncServiceIds.value;
+    syncEvents.value = [];
+    syncSummary.value = null;
+    syncFinalized.value = false;
+    closeSyncEventSource();
+    const result = await apiSend<{ job: Job }>("/api/accounts/sync-platforms", "POST", {
+      source: ids.length ? undefined : "all",
+      serviceIds: ids,
       checkAfterSync: syncCheckAfter.value,
     });
+    syncJob.value = result.job;
     ElMessage.success(`已创建平台同步任务 #${result.job.id}`);
-    syncDialog.value = false;
-    await router.push("/jobs");
+    subscribeSyncStream(result.job.id);
+    await refreshSyncJob();
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   }
+}
+
+function closeSyncEventSource() {
+  if (syncEventSource) {
+    syncEventSource.close();
+    syncEventSource = null;
+  }
+}
+
+async function refreshSyncJob() {
+  if (!syncJob.value) {
+    return;
+  }
+  try {
+    const [jobPayload, eventsPayload] = await Promise.all([
+      apiGet<{ job: Job }>(`/api/jobs/${syncJob.value.id}`),
+      apiGet<{ events: JobEvent[] }>(`/api/jobs/${syncJob.value.id}/events?after=0`),
+    ]);
+    syncJob.value = jobPayload.job;
+    syncEvents.value = eventsPayload.events ?? [];
+    if (syncEvents.value.length) {
+      syncLastEventId = Math.max(...syncEvents.value.map((event) => event.id));
+    }
+    if (jobPayload.job.result) {
+      const summary = (jobPayload.job.result as Record<string, unknown>).result ?? jobPayload.job.result;
+      syncSummary.value = summary as Record<string, unknown>;
+    }
+  } catch (error) {
+    console.warn("拉取同步任务事件失败", error);
+  }
+}
+
+function appendSyncEvent(event: JobEvent) {
+  if (event.id && event.id <= syncLastEventId) {
+    return;
+  }
+  if (event.id) {
+    syncLastEventId = event.id;
+  }
+  syncEvents.value.push(event);
+  if (event.message?.startsWith("jobStatus:")) {
+    const status = event.message.slice(10);
+    if (syncJob.value) {
+      syncJob.value = {...syncJob.value, status};
+    }
+    if (status === "success" || status === "failed" || status === "cancelled") {
+      syncFinalized.value = true;
+      closeSyncEventSource();
+      void refreshSyncJob();
+      void load(true);
+    }
+  }
+}
+
+function subscribeSyncStream(jobId: number) {
+  closeSyncEventSource();
+  syncLastEventId = 0;
+  const source = new EventSource(`/api/jobs/${jobId}/stream`);
+  syncEventSource = source;
+  source.onmessage = (message) => {
+    try {
+      const event = JSON.parse(message.data) as JobEvent;
+      appendSyncEvent(event);
+    } catch (error) {
+      console.warn("解析同步事件失败", error);
+    }
+  };
+  source.onerror = () => {
+    closeSyncEventSource();
+    void refreshSyncJob();
+  };
+}
+
+function closeSyncDialog() {
+  syncDialog.value = false;
+  closeSyncEventSource();
 }
 
 function filenameFromDisposition(disposition: string | null, fallback: string) {
@@ -302,7 +408,7 @@ async function downloadAuth(ids: number[]) {
 
 async function single(
     id: number,
-    action: "check" | "refresh" | "reauth" | "push",
+    action: "check" | "refresh" | "push",
     target: "cpa" | "sub2api" | "both" = "both",
     serviceIds?: number[],
 ) {
@@ -313,9 +419,6 @@ async function single(
     } else if (action === "refresh") {
       await apiSend(`/api/accounts/${id}/refresh`, "POST");
       ElMessage.success("刷新完成");
-    } else if (action === "reauth") {
-      const result = await apiSend<{ job: { id: number } }>(`/api/accounts/${id}/reauth`, "POST");
-      ElMessage.success(`已创建重新授权任务 #${result.job.id}`);
     } else {
       await apiSend(`/api/accounts/${id}/push`, "POST", {target, serviceIds});
       ElMessage.success("推送完成");
@@ -459,6 +562,187 @@ function openDetail(row: Account) {
   detailDialog.value = true;
 }
 
+function closeReauthEventSource() {
+  if (reauthEventSource) {
+    reauthEventSource.close();
+    reauthEventSource = null;
+  }
+}
+
+async function refreshReauthJob() {
+  if (!reauthJob.value) {
+    return;
+  }
+  try {
+    const [jobPayload, eventsPayload] = await Promise.all([
+      apiGet<{ job: Job }>(`/api/jobs/${reauthJob.value.id}`),
+      apiGet<{ events: JobEvent[] }>(`/api/jobs/${reauthJob.value.id}/events?after=0`),
+    ]);
+    reauthJob.value = jobPayload.job;
+    reauthEvents.value = eventsPayload.events ?? [];
+    if (reauthEvents.value.length) {
+      reauthLastEventId = Math.max(...reauthEvents.value.map((event) => event.id));
+    }
+    syncReauthAuthUrlFromJob(jobPayload.job);
+  } catch (error) {
+    console.warn("拉取重登任务事件失败", error);
+  }
+}
+
+function syncReauthAuthUrlFromJob(job: Job | null) {
+  if (!job) {
+    return;
+  }
+  const result = (job.result ?? (job.result_json ? safeJsonParse(job.result_json) : null)) as Record<string, unknown> | null;
+  if (result && typeof result.auth_url === "string" && result.auth_url) {
+    reauthAuthUrl.value = result.auth_url;
+  }
+}
+
+function safeJsonParse(value: string | null | undefined): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function appendReauthEvent(event: JobEvent) {
+  if (event.id && event.id <= reauthLastEventId) {
+    return;
+  }
+  if (event.id) {
+    reauthLastEventId = event.id;
+  }
+  reauthEvents.value.push(event);
+  const match = event.message?.match(/授权链接已生成:\s*(https?:\/\/\S+)/);
+  if (match?.[1]) {
+    reauthAuthUrl.value = match[1];
+  }
+  if (event.message?.startsWith("jobStatus:")) {
+    const status = event.message.slice(10);
+    if (reauthJob.value) {
+      reauthJob.value = {...reauthJob.value, status};
+    }
+    if (status === "success" || status === "failed" || status === "cancelled") {
+      reauthFinalized.value = true;
+      closeReauthEventSource();
+      void load(true);
+    }
+  }
+}
+
+function subscribeReauthStream(jobId: number) {
+  closeReauthEventSource();
+  reauthLastEventId = 0;
+  const source = new EventSource(`/api/jobs/${jobId}/stream`);
+  reauthEventSource = source;
+  source.onmessage = (message) => {
+    try {
+      const event = JSON.parse(message.data) as JobEvent;
+      appendReauthEvent(event);
+    } catch (error) {
+      console.warn("解析重登事件失败", error);
+    }
+  };
+  source.onerror = () => {
+    closeReauthEventSource();
+    void refreshReauthJob();
+  };
+}
+
+async function openReauthDialog(row: Account, mode: "auto" | "manual") {
+  if (mode === "auto" && !row.has_password) {
+    try {
+      await ElMessageBox.confirm(
+          "该账号没有保存密码，自动重登可能在登录阶段失败。是否仍然继续？",
+          "自动重登",
+          {type: "warning", confirmButtonText: "继续", cancelButtonText: "取消"},
+      );
+    } catch {
+      return;
+    }
+  }
+  reauthAccount.value = row;
+  reauthMode.value = mode;
+  reauthEvents.value = [];
+  reauthAuthUrl.value = "";
+  reauthCallbackInput.value = "";
+  reauthSubmittingCallback.value = false;
+  reauthFinalized.value = false;
+  reauthJob.value = null;
+  reauthDialog.value = true;
+  try {
+    const result = await apiSend<{ job: Job }>(`/api/accounts/${row.id}/reauth`, "POST", {mode});
+    reauthJob.value = result.job;
+    subscribeReauthStream(result.job.id);
+    await refreshReauthJob();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+    reauthDialog.value = false;
+  }
+}
+
+async function submitReauthCallback() {
+  if (!reauthJob.value) {
+    return;
+  }
+  const value = reauthCallbackInput.value.trim();
+  if (!value) {
+    ElMessage.warning("请填写回调地址");
+    return;
+  }
+  reauthSubmittingCallback.value = true;
+  try {
+    await apiSend(`/api/jobs/${reauthJob.value.id}/input`, "POST", {value});
+    ElMessage.success("已提交回调地址");
+    reauthCallbackInput.value = "";
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    reauthSubmittingCallback.value = false;
+  }
+}
+
+async function copyAuthorizeUrl() {
+  if (!reauthAuthUrl.value) {
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(reauthAuthUrl.value);
+    ElMessage.success("授权链接已复制");
+  } catch {
+    ElMessage.warning("剪贴板不可用，请手动复制");
+  }
+}
+
+function openAuthorizeUrl() {
+  if (!reauthAuthUrl.value) {
+    return;
+  }
+  window.open(reauthAuthUrl.value, "_blank", "noopener,noreferrer");
+}
+
+async function cancelReauthJob() {
+  if (!reauthJob.value) {
+    return;
+  }
+  try {
+    await apiSend(`/api/jobs/${reauthJob.value.id}/cancel`, "POST");
+    ElMessage.success("已请求取消任务");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function closeReauthDialog() {
+  reauthDialog.value = false;
+  closeReauthEventSource();
+}
+
 function statusTag(row: Account) {
   const status = row.status_code || row.status;
   const match = statusOptions.find((item) => item.value === status);
@@ -473,16 +757,18 @@ function credentialLabel(row: Account) {
   return credentialOptions.find((item) => item.value === value)?.label || value;
 }
 
-function sourceLabel(row: Account) {
-  if (!row.credential_source_kind || row.credential_source_kind === "local") {
-    return "本地";
-  }
-  const kind = row.credential_source_kind === "cpa" ? "CPA" : "Sub2API";
-  return row.credential_source_name ? `${kind} / ${row.credential_source_name}` : kind;
-}
-
 function bindingLabel(binding: BoundPlatformService) {
   return `${binding.kind === "cpa" ? "CPA" : "Sub2API"} / ${binding.name}`;
+}
+
+function bindingTagType(binding: BoundPlatformService): "" | "success" | "warning" | "info" | "danger" {
+  if (binding.lastPushStatus === "success") {
+    return "success";
+  }
+  if (binding.lastPushStatus === "failed") {
+    return "danger";
+  }
+  return "info";
 }
 
 function accountSourceLabel(row: Account) {
@@ -558,14 +844,12 @@ watch(pushTarget, () => {
   selectedServiceIds.value = selectedServiceIds.value.filter((id) => availablePushServices.value.some((service) => service.id === id));
 });
 
-watch(syncSource, () => {
-  selectedSyncServiceIds.value = selectedSyncServiceIds.value.filter((id) => availableSyncServices.value.some((service) => service.id === id));
-});
-
 onBeforeUnmount(() => {
   if (timer) {
     window.clearInterval(timer);
   }
+  closeReauthEventSource();
+  closeSyncEventSource();
 });
 
 watch(pageSize, () => {
@@ -583,7 +867,7 @@ watch(currentPage, () => {
     <div class="page-head">
       <div>
         <h1 class="page-title">账号管理</h1>
-        <p class="page-subtitle">导入 auth、检查状态、刷新凭据、重登授权和推送远端。</p>
+        <p class="page-subtitle">多平台授权文件管理同步：同步外部凭据、统一绑定推送、自动 / 人工重登。</p>
       </div>
       <div class="flex flex-wrap gap-2">
         <el-button :icon="Refresh" type="primary" plain :loading="loading" @click="openSync">同步平台凭据</el-button>
@@ -608,8 +892,13 @@ watch(currentPage, () => {
               <el-option v-for="item in credentialOptions" :key="item.value" :label="item.label" :value="item.value"/>
             </el-select>
           </el-form-item>
-          <el-form-item label="Provider">
-            <el-input v-model="filters.provider" clearable placeholder="hotmail/gmail"/>
+          <el-form-item label="绑定平台">
+            <el-select v-model="bindingFilterServiceIds" multiple collapse-tags clearable filterable class="w-full"
+                       placeholder="全部">
+              <el-option v-for="service in enabledServices" :key="service.id"
+                         :label="`${service.kind === 'cpa' ? 'CPA' : 'Sub2API'} / ${service.name}`"
+                         :value="service.id"/>
+            </el-select>
           </el-form-item>
           <el-form-item label="套餐">
             <el-input v-model="filters.plan" clearable placeholder="free/plus"/>
@@ -622,6 +911,7 @@ watch(currentPage, () => {
           </el-form-item>
           <el-form-item label="推送">
             <el-select v-model="filters.pushStatus" clearable placeholder="全部" class="w-full">
+              <el-option label="已推送" value="pushed"/>
               <el-option label="未推送" value="not_pushed"/>
             </el-select>
           </el-form-item>
@@ -637,7 +927,7 @@ watch(currentPage, () => {
         <div class="flex flex-wrap gap-1.5">
           <el-button @click="bulk('check')">批量检查</el-button>
           <el-button @click="bulk('refresh')">批量刷新</el-button>
-          <el-button @click="bulk('reauth')">批量重登</el-button>
+          <el-button @click="bulk('reauth')">批量自动重登</el-button>
           <el-button @click="openPush()">批量推送</el-button>
           <el-button @click="openBindings()">批量绑定平台</el-button>
           <el-button @click="downloadAuth(selectedIds)">批量导出</el-button>
@@ -662,62 +952,67 @@ watch(currentPage, () => {
             @selection-change="selected = $event"
         >
           <el-table-column type="selection" width="46"/>
-          <el-table-column prop="email" label="邮箱" min-width="220" show-overflow-tooltip/>
-          <el-table-column label="状态" width="150">
+          <el-table-column label="邮箱" min-width="240" show-overflow-tooltip>
             <template #default="{row}">
-              <el-tag :type="statusTag(row).type">{{ statusTag(row).label }}</el-tag>
+              <div class="flex flex-col">
+                <span class="text-sm font-medium">{{ row.email }}</span>
+                <span class="text-xs text-slate-500">{{ credentialLabel(row) }}</span>
+              </div>
             </template>
           </el-table-column>
-          <el-table-column label="凭据" width="160">
+          <el-table-column label="状态" min-width="170">
             <template #default="{row}">
-              <el-tag effect="plain">{{ credentialLabel(row) }}</el-tag>
+              <div class="flex flex-col gap-1">
+                <el-tag :type="statusTag(row).type" size="small">{{ statusTag(row).label }}</el-tag>
+                <el-tag v-if="row.needs_manual_reauth" type="danger" size="small" effect="dark">需要人工重登</el-tag>
+                <span class="text-xs text-slate-500">检查 {{ formatDate(row.last_check_at) }}</span>
+                <el-tooltip v-if="row.last_error" :content="row.last_error" placement="top">
+                  <span class="text-xs text-rose-500 line-clamp-1">{{ row.last_error }}</span>
+                </el-tooltip>
+              </div>
             </template>
           </el-table-column>
-          <el-table-column label="凭据来源" min-width="190" show-overflow-tooltip>
-            <template #default="{row}">
-              <div class="text-sm">{{ sourceLabel(row) }}</div>
-              <div class="text-xs text-slate-500">{{ formatDate(row.credential_synced_at) }}</div>
-            </template>
-          </el-table-column>
-          <el-table-column label="绑定平台" min-width="220">
+          <el-table-column label="绑定平台" min-width="240">
             <template #default="{row}">
               <div v-if="row.platform_bindings?.length" class="flex flex-wrap gap-1">
-                <el-tag v-for="binding in row.platform_bindings" :key="binding.id" size="small" effect="plain">
-                  {{ bindingLabel(binding) }}
-                </el-tag>
+                <el-tooltip
+                    v-for="binding in row.platform_bindings"
+                    :key="binding.id"
+                    :content="`最近推送: ${binding.lastPushStatus || '-'}${binding.lastPushAt ? ' @ ' + formatDate(binding.lastPushAt) : ''}${binding.lastPushMessage ? '\n' + binding.lastPushMessage : ''}`"
+                    placement="top"
+                >
+                  <el-tag :type="bindingTagType(binding)" size="small" effect="plain">
+                    {{ bindingLabel(binding) }}
+                  </el-tag>
+                </el-tooltip>
               </div>
               <span v-else class="text-slate-400">未绑定</span>
             </template>
           </el-table-column>
-          <el-table-column label="账号密码" width="110">
-            <template #default="{row}">
-              <el-tag :type="row.has_password ? 'success' : 'info'" effect="plain">
-                {{ row.has_password ? "已保存" : "未保存" }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="邮箱来源" min-width="170" show-overflow-tooltip>
+          <el-table-column label="邮箱来源" min-width="180" show-overflow-tooltip>
             <template #default="{row}">
               <div class="text-sm">{{ accountSourceLabel(row) }}</div>
               <div v-if="row.source_vendor || row.source_batch_note" class="text-xs text-slate-500">
                 {{ [row.source_vendor, row.source_batch_note].filter(Boolean).join(" / ") }}
               </div>
+              <div class="text-xs text-slate-400">
+                密码 {{ row.has_password ? "已保存" : "未保存" }} · 自动重登
+                {{ row.auto_reauth ? "开启" : "关闭" }}
+              </div>
             </template>
           </el-table-column>
-          <el-table-column prop="plan" label="套餐" width="110">
-            <template #default="{row}">{{ row.plan || "-" }}</template>
-          </el-table-column>
-          <el-table-column label="套餐剩余" min-width="290">
+          <el-table-column label="套餐 / 剩余" min-width="280">
             <template #default="{row}">
-              <div v-if="usageWindows(row).length" class="space-y-1">
+              <div class="text-xs text-slate-500">{{ row.plan || "-" }}</div>
+              <div v-if="usageWindows(row).length" class="mt-1 space-y-1">
                 <div v-for="window in usageWindows(row)" :key="window.window_key">
                   <div class="flex items-center gap-2">
-                    <span class="w-12 text-xs text-slate-500">{{ window.label }}</span>
+                    <span class="w-10 text-xs text-slate-500">{{ window.label }}</span>
                     <el-progress :percentage="Math.max(0, Math.min(100, window.remaining_percent ?? 0))"
-                                 :stroke-width="8" class="min-w-28 flex-1"/>
+                                 :stroke-width="8" class="min-w-24 flex-1"/>
                     <span class="w-16 text-xs">{{ formatPercent(window.remaining_percent) }}</span>
                   </div>
-                  <div class="ml-14 text-xs text-slate-500">{{ formatResetAt(window.reset_at) }}</div>
+                  <div class="ml-12 text-xs text-slate-500">{{ formatResetAt(window.reset_at) }}</div>
                 </div>
               </div>
               <span v-else class="text-slate-400">未返回</span>
@@ -727,37 +1022,35 @@ watch(currentPage, () => {
             <template #default="{row}">
               <el-tag
                   :type="row.step_status === 'failed' ? 'danger' : row.step_status === 'success' ? 'success' : 'warning'"
-                  effect="plain">
+                  size="small" effect="plain">
                 {{ row.current_step || "未检查" }}
               </el-tag>
+              <div class="text-xs text-slate-500">{{ formatDate(row.last_step_at) }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="最近检查" width="170">
-            <template #default="{row}">{{ formatDate(row.last_check_at) }}</template>
-          </el-table-column>
-          <el-table-column label="添加时间" width="170">
-            <template #default="{row}">{{ formatDate(row.created_at) }}</template>
-          </el-table-column>
-          <el-table-column label="操作" fixed="right" width="200">
+          <el-table-column label="操作" fixed="right" width="240">
             <template #default="{row}">
               <div class="table-actions">
-                <div>
-                  <el-button link type="primary" @click="openDetail(row)">详情</el-button>
-                  <el-button link type="primary" @click="single(row.id, 'check')">检查</el-button>
-                  <el-button link type="primary" @click="single(row.id, 'refresh')">刷新</el-button>
-                  <el-popconfirm title="确定重新登录授权这个账号？" @confirm="single(row.id, 'reauth')">
-                    <template #reference>
-                      <el-button link type="warning">重登</el-button>
-                    </template>
-                  </el-popconfirm>
-                </div>
-                <div>
-                  <el-button link type="primary" @click="openPush(row)">推送</el-button>
-                  <el-button link type="primary" @click="openBindings(row)">绑定</el-button>
-                  <el-button link type="primary" @click="downloadAuth([row.id])">导出</el-button>
-                  <el-button link type="primary" @click="openProfile(row)">编辑</el-button>
-                </div>
-
+                <el-button link type="primary" @click="single(row.id, 'check')">检查</el-button>
+                <el-button link type="primary" @click="single(row.id, 'refresh')">刷新</el-button>
+                <el-dropdown trigger="click" @command="(mode: 'auto' | 'manual') => openReauthDialog(row, mode)">
+                  <el-button link :type="row.needs_manual_reauth ? 'danger' : 'warning'">重登
+                    <el-icon class="el-icon--right">
+                      <i-ep-arrow-down/>
+                    </el-icon>
+                  </el-button>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="auto">自动重登（密码 + 邮箱验证码）</el-dropdown-item>
+                      <el-dropdown-item command="manual">人工重登（OAuth 回填）</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+                <el-button link type="primary" @click="openPush(row)">推送</el-button>
+                <el-button link type="primary" @click="openBindings(row)">绑定</el-button>
+                <el-button link type="primary" @click="openProfile(row)">配置</el-button>
+                <el-button link type="primary" @click="openDetail(row)">详情</el-button>
+                <el-button link type="primary" @click="downloadAuth([row.id])">导出</el-button>
               </div>
             </template>
           </el-table-column>
@@ -849,22 +1142,18 @@ watch(currentPage, () => {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="syncDialog" title="同步平台凭据" width="520px">
-      <el-alert title="同步会从已配置的平台服务拉取凭据，按服务优先级处理同邮箱冲突，并写入本地账号管理。" type="info"
-                show-icon class="mb-4"/>
+    <el-dialog v-model="syncDialog" title="同步平台凭据" width="640px" :close-on-click-modal="false"
+               @close="closeSyncDialog">
+      <el-alert
+          title="勾选要拉取的平台服务（可同时选 CPA 与 Sub2API）。留空则同步全部启用的服务。同步过程中匹配到本地账号的会自动建立绑定。"
+          type="info"
+          show-icon class="mb-4"/>
       <el-form label-position="top">
-        <el-form-item label="同步来源">
-          <el-segmented
-              v-model="syncSource"
-              :options="[{label: '全部', value: 'all'}, {label: 'CPA', value: 'cpa'}, {label: 'Sub2API', value: 'sub2api'}]"
-              class="w-full"
-          />
-        </el-form-item>
-        <el-form-item label="指定服务">
+        <el-form-item label="平台服务">
           <el-select v-model="selectedSyncServiceIds" multiple clearable filterable class="w-full"
-                     placeholder="留空使用全部启用服务">
+                     :disabled="syncJob !== null && !syncFinalized" placeholder="留空使用全部启用服务">
             <el-option
-                v-for="service in availableSyncServices"
+                v-for="service in enabledServices"
                 :key="service.id"
                 :label="`${service.kind === 'cpa' ? 'CPA' : 'Sub2API'} / ${service.name}`"
                 :value="service.id"
@@ -872,12 +1161,55 @@ watch(currentPage, () => {
           </el-select>
         </el-form-item>
         <el-form-item label="同步后检查状态">
-          <el-switch v-model="syncCheckAfter" active-text="开启" inactive-text="关闭"/>
+          <el-switch v-model="syncCheckAfter" :disabled="syncJob !== null && !syncFinalized" active-text="开启"
+                     inactive-text="关闭"/>
         </el-form-item>
       </el-form>
+
+      <div v-if="syncJob" class="mt-2">
+        <div class="mb-2 flex items-center justify-between">
+          <span class="text-sm font-semibold text-slate-700">同步进度</span>
+          <el-tag
+              :type="syncJob.status === 'success' ? 'success' : syncJob.status === 'failed' ? 'danger' : syncJob.status === 'cancelled' ? 'info' : 'warning'"
+              size="small">{{ syncJob.status }}
+          </el-tag>
+        </div>
+        <div v-if="syncSummary && syncFinalized" class="mb-2 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+          <div class="rounded bg-emerald-50 p-2">
+            <div class="text-slate-500">新建账号</div>
+            <div class="text-lg font-semibold text-emerald-600">{{ syncSummary.imported ?? 0 }}</div>
+          </div>
+          <div class="rounded bg-sky-50 p-2">
+            <div class="text-slate-500">更新匹配</div>
+            <div class="text-lg font-semibold text-sky-600">{{ syncSummary.updated ?? 0 }}</div>
+          </div>
+          <div class="rounded bg-amber-50 p-2">
+            <div class="text-slate-500">跳过</div>
+            <div class="text-lg font-semibold text-amber-600">{{ syncSummary.skipped ?? 0 }}</div>
+          </div>
+          <div class="rounded bg-rose-50 p-2">
+            <div class="text-slate-500">失败</div>
+            <div class="text-lg font-semibold text-rose-600">{{ syncSummary.failed ?? 0 }}</div>
+          </div>
+        </div>
+        <div class="max-h-56 overflow-auto rounded-md border border-slate-200 bg-slate-50 p-3 text-xs">
+          <div v-if="!syncEvents.length" class="text-slate-400">等待任务事件…</div>
+          <div v-for="event in syncEvents" :key="event.id" class="flex gap-2 py-0.5">
+            <span class="w-32 shrink-0 text-slate-400">{{ formatDate(event.created_at) }}</span>
+            <el-tag size="small"
+                    :type="event.level === 'error' ? 'danger' : event.level === 'warn' ? 'warning' : event.level === 'success' ? 'success' : 'info'"
+                    effect="plain">{{ event.level }}
+            </el-tag>
+            <span class="flex-1 break-all text-slate-700">{{ event.message }}</span>
+          </div>
+        </div>
+      </div>
+
       <template #footer>
-        <el-button @click="syncDialog = false">取消</el-button>
-        <el-button type="primary" @click="confirmSync">创建同步任务</el-button>
+        <el-button @click="closeSyncDialog">{{ syncFinalized ? "关闭" : "取消" }}</el-button>
+        <el-button v-if="!syncJob || syncFinalized" type="primary" @click="confirmSync">
+          {{ syncJob && syncFinalized ? "再次同步" : "创建同步任务" }}
+        </el-button>
       </template>
     </el-dialog>
 
@@ -903,7 +1235,7 @@ watch(currentPage, () => {
               placeholder="选择需要绑定的平台"
           >
             <el-option
-                v-for="service in services.filter((item) => item.enabled)"
+                v-for="service in enabledServices"
                 :key="service.id"
                 :label="`${service.kind === 'cpa' ? 'CPA' : 'Sub2API'} / ${service.name}`"
                 :value="service.id"
@@ -920,6 +1252,86 @@ watch(currentPage, () => {
       </template>
     </el-dialog>
 
+    <el-dialog v-model="reauthDialog" :close-on-click-modal="false" width="640px" @close="closeReauthDialog">
+      <template #header>
+        <span class="font-semibold">
+          {{ reauthMode === "manual" ? "人工重登" : "自动重登" }} ·
+          {{ reauthAccount?.email || "-" }}
+        </span>
+      </template>
+      <div v-if="reauthMode === 'auto'" class="space-y-3">
+        <el-alert
+            title="自动重登使用账号保存的密码登录，邮箱验证码从账号关联的邮箱来源自动取件，不使用短信。"
+            type="info" show-icon/>
+        <div v-if="reauthAccount && !reauthAccount.has_password" class="text-sm text-amber-500">
+          ⚠️ 该账号未保存密码，自动登录大概率失败，将自动转为需要人工重登。
+        </div>
+        <div v-if="reauthAccount && !reauthAccount.source_id" class="text-sm text-amber-500">
+          ⚠️ 该账号未关联邮箱来源，若登录需要邮箱验证码将无法自动获取。
+        </div>
+      </div>
+      <div v-else class="space-y-3">
+        <el-alert
+            title="人工重登：复制下方授权链接，在浏览器登录后将地址栏中的完整回调地址粘贴回来，由系统交换 token 并生成授权文件。"
+            type="info" show-icon/>
+        <div class="rounded-md border border-slate-200 bg-slate-50 p-3">
+          <div class="mb-2 text-xs font-semibold text-slate-500">授权链接</div>
+          <div v-if="reauthAuthUrl" class="break-all rounded bg-white p-2 font-mono text-xs text-slate-700">
+            {{ reauthAuthUrl }}
+          </div>
+          <div v-else class="text-sm text-slate-400">正在生成授权链接…</div>
+          <div class="mt-2 flex gap-2">
+            <el-button :icon="CopyDocument" size="small" :disabled="!reauthAuthUrl" @click="copyAuthorizeUrl">复制
+            </el-button>
+            <el-button size="small" type="primary" :disabled="!reauthAuthUrl" @click="openAuthorizeUrl">在浏览器打开
+            </el-button>
+          </div>
+        </div>
+        <el-form label-position="top">
+          <el-form-item label="回调地址">
+            <el-input
+                v-model="reauthCallbackInput"
+                type="textarea"
+                :rows="2"
+                placeholder="登录完成后浏览器地址栏中以 http://localhost/ 开头的完整地址"
+            />
+          </el-form-item>
+        </el-form>
+        <div class="flex justify-end">
+          <el-button type="primary" :loading="reauthSubmittingCallback" :disabled="!reauthJob || reauthFinalized"
+                     @click="submitReauthCallback">提交回调
+          </el-button>
+        </div>
+      </div>
+
+      <div class="mt-4">
+        <div class="mb-2 flex items-center justify-between">
+          <span class="text-sm font-semibold text-slate-700">进度</span>
+          <el-tag v-if="reauthJob"
+                  :type="reauthJob.status === 'success' ? 'success' : reauthJob.status === 'failed' ? 'danger' : reauthJob.status === 'cancelled' ? 'info' : 'warning'"
+                  size="small">{{ reauthJob.status }}
+          </el-tag>
+        </div>
+        <div class="max-h-64 overflow-auto rounded-md border border-slate-200 bg-slate-50 p-3 text-xs">
+          <div v-if="!reauthEvents.length" class="text-slate-400">等待任务事件…</div>
+          <div v-for="event in reauthEvents" :key="event.id" class="flex gap-2 py-0.5">
+            <span class="w-32 shrink-0 text-slate-400">{{ formatDate(event.created_at) }}</span>
+            <el-tag size="small"
+                    :type="event.level === 'error' ? 'danger' : event.level === 'warn' ? 'warning' : event.level === 'success' ? 'success' : 'info'"
+                    effect="plain">{{ event.level }}
+            </el-tag>
+            <span class="flex-1 break-all text-slate-700">{{ event.message }}</span>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <el-button v-if="reauthJob && !reauthFinalized" type="danger" plain @click="cancelReauthJob">取消任务
+        </el-button>
+        <el-button @click="closeReauthDialog">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="detailDialog" title="账号详情" width="720px">
       <template v-if="activeAccount">
         <el-descriptions :column="2" border>
@@ -927,7 +1339,25 @@ watch(currentPage, () => {
           <el-descriptions-item label="Provider">{{ activeAccount.provider || "-" }}</el-descriptions-item>
           <el-descriptions-item label="状态">{{ statusTag(activeAccount).label }}</el-descriptions-item>
           <el-descriptions-item label="凭据">{{ credentialLabel(activeAccount) }}</el-descriptions-item>
-          <el-descriptions-item label="凭据来源">{{ sourceLabel(activeAccount) }}</el-descriptions-item>
+          <el-descriptions-item label="是否需要人工重登">
+            <el-tag v-if="activeAccount.needs_manual_reauth" type="danger">是</el-tag>
+            <span v-else>否</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="最近重登尝试">{{
+              formatDate(activeAccount.last_reauth_attempt_at)
+            }}
+          </el-descriptions-item>
+          <el-descriptions-item label="最近重登错误" :span="2">{{
+              activeAccount.last_reauth_error || "-"
+            }}
+          </el-descriptions-item>
+          <el-descriptions-item label="凭据来源">
+            {{
+              activeAccount.credential_source_kind && activeAccount.credential_source_kind !== "local"
+                  ? `${activeAccount.credential_source_kind === "cpa" ? "CPA" : "Sub2API"}${activeAccount.credential_source_name ? " / " + activeAccount.credential_source_name : ""}`
+                  : "本地"
+            }}
+          </el-descriptions-item>
           <el-descriptions-item label="最近同步">{{
               formatDate(activeAccount.credential_synced_at)
             }}
@@ -937,14 +1367,14 @@ watch(currentPage, () => {
             }}
           </el-descriptions-item>
           <el-descriptions-item label="邮箱来源">{{ accountSourceLabel(activeAccount) }}</el-descriptions-item>
-          <el-descriptions-item label="绑定平台">
+          <el-descriptions-item label="绑定平台" :span="2">
             <span v-if="!activeAccount.platform_bindings?.length">-</span>
             <span v-else>{{ activeAccount.platform_bindings.map(bindingLabel).join("，") }}</span>
           </el-descriptions-item>
-          <el-descriptions-item label="auth 文件">
+          <el-descriptions-item label="auth 文件" :span="2">
             <span class="mono">{{ activeAccount.auth_file_name || "-" }}</span>
           </el-descriptions-item>
-          <el-descriptions-item label="最近错误">{{ activeAccount.last_error || "-" }}</el-descriptions-item>
+          <el-descriptions-item label="最近错误" :span="2">{{ activeAccount.last_error || "-" }}</el-descriptions-item>
         </el-descriptions>
         <el-timeline class="mt-5">
           <el-timeline-item :timestamp="formatDate(activeAccount.last_step_at)"

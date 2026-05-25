@@ -32,7 +32,7 @@ const form = reactive({
 
 const hotmailModes = [
   {label: "Outlook / Graph", value: "graph"},
-  {label: "熊猫点", value: "xiongmaodian"},
+  {label: "熊猫电竞", value: "xiongmaodian"},
 ];
 
 const pagedSources = computed(() => sources.value.slice((currentPage.value - 1) * pageSize.value, currentPage.value * pageSize.value));

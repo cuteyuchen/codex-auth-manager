@@ -19,6 +19,7 @@ import {
   updateBindingPushResult,
   type BoundPlatformService,
 } from "./account-platform-binding-service.js";
+import {createJob, runJob} from "./job-service.js";
 
 export interface AuthRecord {
     access_token?: string;
@@ -848,6 +849,9 @@ export interface AccountListItem {
     credential_source_service_id: number | null;
     credential_source_remote_id: string | null;
     credential_synced_at: string | null;
+    needs_manual_reauth: number;
+    last_reauth_attempt_at: string | null;
+    last_reauth_error: string | null;
     source_id: number | null;
     source_name: string | null;
     source_provider: string | null;
@@ -866,6 +870,7 @@ export interface AccountFilters {
     plan?: string;
     autoReauth?: string;
     pushStatus?: string;
+    bindingServiceIds?: number[];
     page?: number;
     pageSize?: number;
 }
@@ -873,7 +878,17 @@ export interface AccountFilters {
 export function listAccounts(filters: string | AccountFilters = ""): AccountListItem[] {
   const normalized: AccountFilters = typeof filters === "string" ? {q: filters} : filters;
   const q = `%${String(normalized.q ?? "").trim()}%`;
-  const rows = getDb().prepare(`
+  const bindingIds = Array.isArray(normalized.bindingServiceIds)
+    ? [...new Set(normalized.bindingServiceIds.map(Number).filter((value) => Number.isFinite(value) && value > 0))]
+    : [];
+  const bindingNames = bindingIds.map((_, index) => `@bindingId${index}`);
+  const bindingClause = bindingIds.length
+    ? `AND EXISTS (
+        SELECT 1 FROM account_platform_bindings b
+        WHERE b.account_id = a.id AND b.integration_service_id IN (${bindingNames.join(",")})
+      )`
+    : "";
+  const sql = `
         SELECT
             a.id,
             a.email,
@@ -902,6 +917,9 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
             a.credential_source_service_id,
             a.credential_source_remote_id,
             a.credential_synced_at,
+            a.needs_manual_reauth,
+            a.last_reauth_attempt_at,
+            a.last_reauth_error,
             a.source_id,
             ms.name AS source_name,
             ms.provider AS source_provider,
@@ -918,18 +936,25 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
         LEFT JOIN auth_files af ON af.account_id = a.id AND af.active = 1
         LEFT JOIN mail_sources ms ON ms.id = a.source_id
         WHERE (@query = '' OR a.email LIKE @q OR a.status LIKE @q OR a.status_code LIKE @q)
-          AND (@status = '' OR COALESCE(a.status_code, a.status) = @status)
+          AND (@status = '' OR
+                (@status = 'needs_manual_reauth' AND a.needs_manual_reauth = 1) OR
+                COALESCE(a.status_code, a.status) = @status)
           AND (@credentialType = '' OR COALESCE(af.credential_type, a.credential_type, 'none') = @credentialType)
           AND (@provider = '' OR COALESCE(a.provider, '') = @provider)
           AND (@plan = '' OR COALESCE(a.plan, '') = @plan)
           AND (@autoReauth = '' OR a.auto_reauth = CASE WHEN @autoReauth = 'true' THEN 1 ELSE 0 END)
           AND (
             @pushStatus = ''
-            OR (@pushStatus = 'not_pushed' AND af.id IS NOT NULL AND af.last_cpa_push_at IS NULL AND af.last_sub2api_push_at IS NULL)
+            OR (@pushStatus = 'pushed' AND EXISTS (
+                  SELECT 1 FROM account_platform_bindings b WHERE b.account_id = a.id))
+            OR (@pushStatus = 'not_pushed' AND NOT EXISTS (
+                  SELECT 1 FROM account_platform_bindings b WHERE b.account_id = a.id))
           )
+          ${bindingClause}
         ORDER BY a.created_at DESC, a.id DESC
         LIMIT @limit OFFSET @offset
-    `).all({
+    `;
+  const params: Record<string, unknown> = {
     query: String(normalized.q ?? "").trim(),
     q,
     status: String(normalized.status ?? "").trim(),
@@ -940,7 +965,11 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
     pushStatus: String(normalized.pushStatus ?? "").trim(),
     limit: Math.min(500, Math.max(1, Number(normalized.pageSize ?? 200) || 200)),
     offset: Math.max(0, ((Number(normalized.page ?? 1) || 1) - 1) * (Number(normalized.pageSize ?? 200) || 200)),
-  }) as AccountListItem[];
+  };
+  bindingIds.forEach((id, index) => {
+    params[`bindingId${index}`] = id;
+  });
+  const rows = getDb().prepare(sql).all(params) as AccountListItem[];
   const ids = rows.map((row) => row.id);
   const windowsByAccount = new Map<number, AccountUsageWindow[]>();
   if (ids.length) {
@@ -1127,7 +1156,55 @@ export async function checkAccount(accountId: number, forceRefresh = false): Pro
     const record = await loadAuthRecord(authFile.file_path);
     upsertAuthFile(accountId, authFile.file_path, record, {preserveSource: true});
   }
+  maybeTriggerAutoReauth(accountId, summary);
   return summary;
+}
+
+const REAUTH_ELIGIBLE_STATUS_CODES = new Set(["credential_expired", "credential_invalid"]);
+const reauthTriggerInFlight = new Set<number>();
+
+function maybeTriggerAutoReauth(accountId: number, summary: AuthSummary): void {
+  if (!REAUTH_ELIGIBLE_STATUS_CODES.has(summary.statusCode)) {
+    return;
+  }
+  if (reauthTriggerInFlight.has(accountId)) {
+    return;
+  }
+  const row = getDb().prepare(`
+    SELECT a.auto_reauth, a.password_encrypted, a.needs_manual_reauth, a.email
+    FROM accounts a
+    WHERE a.id = ?
+  `).get(accountId) as {auto_reauth: number; password_encrypted: string | null; needs_manual_reauth: number; email: string} | undefined;
+  if (!row) {
+    return;
+  }
+  if (row.auto_reauth !== 1) {
+    return;
+  }
+  if (!row.password_encrypted) {
+    return;
+  }
+  if (row.needs_manual_reauth === 1) {
+    return;
+  }
+  reauthTriggerInFlight.add(accountId);
+  const job = createJob("reauth", `自动重登 ${row.email}`, {id: accountId, mode: "auto", trigger: "auto"});
+  void (async () => {
+    try {
+      const {reauthorizeAccount} = await import("./registration-service.js");
+      await runJob(job.id, async () => {
+        const result = await reauthorizeAccount(accountId, job.id, {mode: "auto"});
+        try {
+          await pushAccountToBoundPlatforms(accountId);
+          return {...result, boundPlatformPush: "success"};
+        } catch (error) {
+          return {...result, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)};
+        }
+      }, {exclusiveRegister: true});
+    } finally {
+      reauthTriggerInFlight.delete(accountId);
+    }
+  })();
 }
 
 export type PushTarget = "cpa" | "sub2api" | "both";

@@ -260,7 +260,7 @@ async function createMailboxProvider(type: Pick<MailTypeRow, "provider" | "subty
     refreshToken,
     accessToken,
     scope: "",
-    apiMode: "graph",
+    apiMode: "",
     fileName: `mailbox:${mailbox.id}`,
     filePath: "database",
     raw: {source: "database-mailbox", mailboxId: mailbox.id},
@@ -735,6 +735,23 @@ export function deleteMailbox(id: number): {ok: true} {
   ensureMailbox(id);
   getDb().prepare("DELETE FROM mailboxes WHERE id = ?").run(id);
   return {ok: true};
+}
+
+export interface MailboxSecrets {
+    password: string;
+    client_id: string;
+    refresh_token: string;
+    access_token: string;
+}
+
+export async function getMailboxSecrets(id: number): Promise<MailboxSecrets> {
+  const mailbox = ensureMailbox(id);
+  return {
+    password: mailbox.password_encrypted ? await decryptSecret(mailbox.password_encrypted) : "",
+    client_id: mailbox.client_id_encrypted ? await decryptSecret(mailbox.client_id_encrypted) : "",
+    refresh_token: mailbox.refresh_token_encrypted ? await decryptSecret(mailbox.refresh_token_encrypted) : "",
+    access_token: mailbox.access_token_encrypted ? await decryptSecret(mailbox.access_token_encrypted) : "",
+  };
 }
 
 function ensureMailboxBySourceAndEmail(sourceId: number, email: string): MailboxRow {

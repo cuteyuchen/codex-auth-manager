@@ -314,27 +314,21 @@ async function persistAccount(account) {
 function buildRefreshVariants(account) {
   const redirectUri = String(account.redirectUri ?? "").trim();
   const scope = String(account.scope ?? "").trim();
-  const apiMode = resolveApiMode(account);
-  const variants = apiMode === "rest" ? [
-    {redirectUri: "", scope: HOTMAIL_REST_READ_SCOPE},
-    {redirectUri, scope: HOTMAIL_REST_READ_SCOPE},
-    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_REST_READ_SCOPE},
-    ...(isRestScope(scope) ? [{redirectUri, scope}] : []),
-    {redirectUri: "", scope: ""},
-    {redirectUri, scope: ""},
-    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: ""},
-  ] : [
-    {redirectUri: "", scope: HOTMAIL_GRAPH_READ_SCOPE},
-    {redirectUri, scope: HOTMAIL_GRAPH_READ_SCOPE},
-    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_GRAPH_READ_SCOPE},
-    {redirectUri: "", scope: HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE},
-    {redirectUri, scope: HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE},
-    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE},
-    {redirectUri: "", scope: HOTMAIL_LEGACY_SCOPE},
-    {redirectUri, scope: HOTMAIL_LEGACY_SCOPE},
-    {redirectUri: HOTMAIL_DEFAULT_REDIRECT_URI, scope: HOTMAIL_LEGACY_SCOPE},
-    ...(isGraphScope(scope) ? [{redirectUri, scope}] : []),
+  const redirects = ["", redirectUri, HOTMAIL_DEFAULT_REDIRECT_URI];
+  const scopes = [
+    ...(isRestScope(scope) || isGraphScope(scope) ? [scope] : []),
+    HOTMAIL_GRAPH_READ_SCOPE,
+    HOTMAIL_GRAPH_QUALIFIED_READ_SCOPE,
+    HOTMAIL_LEGACY_SCOPE,
+    HOTMAIL_REST_READ_SCOPE,
+    "",
   ];
+  const variants = [];
+  for (const variantScope of scopes) {
+    for (const variantRedirect of redirects) {
+      variants.push({redirectUri: variantRedirect, scope: variantScope});
+    }
+  }
   const seen = new Set();
 
   return variants.filter((item) => {

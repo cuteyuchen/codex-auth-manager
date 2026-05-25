@@ -60,6 +60,9 @@ export interface Account {
     credential_source_service_id: number | null;
     credential_source_remote_id: string | null;
     credential_synced_at: string | null;
+    needs_manual_reauth: number;
+    last_reauth_attempt_at: string | null;
+    last_reauth_error: string | null;
     source_id: number | null;
     source_name: string | null;
     source_provider: string | null;
@@ -170,6 +173,13 @@ export interface Mailbox {
     last_error: string | null;
     created_at: string;
     updated_at: string;
+}
+
+export interface MailboxSecrets {
+    password: string;
+    client_id: string;
+    refresh_token: string;
+    access_token: string;
 }
 
 export interface LatestEmail {

@@ -516,6 +516,16 @@ export class OpenAIClient {
     return `${AUTH_BASE_URL}/oauth/authorize?${query.toString()}`;
   }
 
+  async finalizeManualCallback(callbackURL: string): Promise<AuthLoginResult> {
+    if (!this.state || !this.codeVerifier) {
+      throw new Error("尚未生成授权链接，无法处理 callback");
+    }
+    const result = this.extractAuthResult(callbackURL);
+    const authRecord = await this.exchangeCodeForToken(result.code);
+    result.authFile = await this.saveAuthRecord(authRecord);
+    return result;
+  }
+
   async authorizeContinue(): Promise<string> {
     const sentinelToken = await this.fetchSentinelToken("authorize_continue");
     const response = await this.fetch(AUTH_AUTHORIZE_CONTINUE_URL, {

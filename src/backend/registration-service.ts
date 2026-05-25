@@ -19,6 +19,7 @@ import {
   isJobCancellationRequested,
   onJobCancelled,
   throwIfJobCancelled,
+  updateJobStatus,
   waitForJobInput,
 } from "./job-service.js";
 import {getDb, currentTimestamp} from "./db.js";
@@ -539,25 +540,89 @@ export function assertRegistrationSucceeded(result: RegisterResult): RegisterRes
   return result;
 }
 
-export async function reauthorizeAccount(accountId: number, jobId?: number): Promise<{email: string; authFile?: string}> {
+export type ReauthMode = "auto" | "manual";
+
+function setNeedsManualReauth(accountId: number, errorMessage: string): void {
+  const timestamp = currentTimestamp();
+  getDb().prepare(`
+    UPDATE accounts
+    SET needs_manual_reauth = 1,
+        last_reauth_attempt_at = @last_reauth_attempt_at,
+        last_reauth_error = @last_reauth_error,
+        last_error = @last_error,
+        updated_at = @updated_at
+    WHERE id = @id
+  `).run({
+    id: accountId,
+    last_reauth_attempt_at: timestamp,
+    last_reauth_error: errorMessage,
+    last_error: errorMessage,
+    updated_at: timestamp,
+  });
+}
+
+function clearNeedsManualReauth(accountId: number): void {
+  const timestamp = currentTimestamp();
+  getDb().prepare(`
+    UPDATE accounts
+    SET needs_manual_reauth = 0,
+        last_reauth_attempt_at = @last_reauth_attempt_at,
+        last_reauth_error = NULL,
+        updated_at = @updated_at
+    WHERE id = @id
+  `).run({
+    id: accountId,
+    last_reauth_attempt_at: timestamp,
+    updated_at: timestamp,
+  });
+}
+
+export async function reauthorizeAccount(
+  accountId: number,
+  jobId?: number,
+  options: {mode?: ReauthMode} = {},
+): Promise<{email: string; authFile?: string}> {
+  const mode: ReauthMode = options.mode ?? "auto";
   const account = getAccount(accountId);
   const password = await getAccountPassword(account);
   const deviceProfile = generateRandomDeviceProfile();
-  const emailOtpProvider = jobId
-    ? async (targetEmail: string, excludeCodes: string[]) => {
-      const code = await waitForJobInput(jobId, `请输入 ${targetEmail} 的邮箱验证码`);
-      if (excludeCodes.includes(code)) {
-        throw new Error(`验证码已使用过: ${code}`);
+  const databaseProvider = account.source_id ? createDatabaseMailboxProvider(account.source_id) : null;
+  if (mode === "auto" && jobId) {
+    addJobEvent(jobId, "info", databaseProvider
+      ? `自动重登: 优先使用邮箱来源 #${account.source_id} 取邮箱验证码`
+      : "自动重登: 账号未配置邮箱来源，将无法处理邮箱验证");
+  }
+  const emailOtpProvider = async (targetEmail: string, excludeCodes: string[]) => {
+    if (databaseProvider) {
+      try {
+        const code = await databaseProvider.getEmailVerificationCode(targetEmail, {excludeCodes});
+        logEmailOtpCode(targetEmail, code);
+        return code;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (mode === "auto") {
+          throw new Error(`邮箱自动取码失败: ${message}`);
+        }
+        if (jobId) {
+          addJobEvent(jobId, "warn", `邮箱自动取码失败: ${message}，等待人工输入`);
+        }
       }
-      logEmailOtpCode(targetEmail, code);
-      return code;
     }
-    : undefined;
+    if (!jobId || mode === "auto") {
+      throw new Error("账号未配置可用的邮箱来源，无法自动取码");
+    }
+    const code = await waitForJobInput(jobId, `请输入 ${targetEmail} 的邮箱验证码`);
+    if (excludeCodes.includes(code)) {
+      throw new Error(`验证码已使用过: ${code}`);
+    }
+    logEmailOtpCode(targetEmail, code);
+    return code;
+  };
   const client = new OpenAIClient({
     email: account.email,
     password,
     deviceProfile,
-    manualMode: Boolean(jobId),
+    manualMode: mode === "manual" && Boolean(jobId),
     emailOtpProvider,
     progressCallback: jobId
       ? (_step, _total, message) => {
@@ -565,12 +630,14 @@ export async function reauthorizeAccount(accountId: number, jobId?: number): Pro
         addJobEvent(jobId, "info", `凭据阶段: ${message}`);
       }
       : undefined,
-    smsBroker: createBroker(),
+    smsBroker: mode === "auto" ? undefined : createBroker(),
+    smsVerificationDisabled: mode === "auto",
     shouldCancel: () => jobId ? isJobCancellationRequested(jobId) : false,
   });
-  const result = await client.authLoginHTTP();
-  await importAuthFileFromResult(result.authFile, password);
-  getDb().prepare(`
+  try {
+    const result = await client.authLoginHTTP();
+    await importAuthFileFromResult(result.authFile, password);
+    getDb().prepare(`
         UPDATE accounts
         SET status = 'reauthorized',
             last_auth_at = @last_auth_at,
@@ -578,12 +645,83 @@ export async function reauthorizeAccount(accountId: number, jobId?: number): Pro
             updated_at = @updated_at
         WHERE id = @id
     `).run({
-    id: accountId,
-    last_auth_at: currentTimestamp(),
-    updated_at: currentTimestamp(),
-  });
-  if (jobId) {
-    addJobEvent(jobId, "success", `重新授权成功: ${account.email}`);
+      id: accountId,
+      last_auth_at: currentTimestamp(),
+      updated_at: currentTimestamp(),
+    });
+    clearNeedsManualReauth(accountId);
+    if (jobId) {
+      addJobEvent(jobId, "success", `重新授权成功: ${account.email}`);
+    }
+    return {email: account.email, authFile: result.authFile};
+  } catch (error) {
+    if (error instanceof JobCancelledError) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (mode === "auto") {
+      setNeedsManualReauth(accountId, message);
+      if (jobId) {
+        addJobEvent(jobId, "error", `自动重登失败已标记为需要人工重登: ${message}`);
+      }
+    } else if (jobId) {
+      addJobEvent(jobId, "error", `重新授权失败: ${message}`);
+    }
+    throw error;
   }
-  return {email: account.email, authFile: result.authFile};
+}
+
+export async function manualReauthAccount(
+  accountId: number,
+  jobId: number,
+): Promise<{email: string; authFile?: string}> {
+  const account = getAccount(accountId);
+  const deviceProfile = generateRandomDeviceProfile();
+  const client = new OpenAIClient({
+    email: account.email,
+    password: "",
+    deviceProfile,
+    manualMode: true,
+    progressCallback: (_step, _total, message) => {
+      updateAuthFileStep(accountId, message, "running");
+      addJobEvent(jobId, "info", `凭据阶段: ${message}`);
+    },
+    shouldCancel: () => isJobCancellationRequested(jobId),
+  });
+  const authorizeUrl = client.prepareManualLogin();
+  addJobEvent(jobId, "info", `授权链接已生成: ${authorizeUrl}`);
+  updateJobStatus(jobId, "waiting_input", {
+    result: {auth_url: authorizeUrl, callback_required: true, account_id: accountId},
+    inputPrompt: "请在浏览器登录后，粘贴回调地址（http://localhost/?code=...&state=...）",
+  });
+  try {
+    const callbackUrl = await waitForJobInput(jobId, "请在浏览器登录后，粘贴回调地址");
+    updateJobStatus(jobId, "running", {result: {auth_url: authorizeUrl, callback_received: true}});
+    addJobEvent(jobId, "info", "已收到回调地址，正在交换授权码");
+    const result = await client.finalizeManualCallback(callbackUrl.trim());
+    const password = await getAccountPassword(account);
+    await importAuthFileFromResult(result.authFile, password);
+    getDb().prepare(`
+        UPDATE accounts
+        SET status = 'reauthorized',
+            last_auth_at = @last_auth_at,
+            last_error = NULL,
+            updated_at = @updated_at
+        WHERE id = @id
+    `).run({
+      id: accountId,
+      last_auth_at: currentTimestamp(),
+      updated_at: currentTimestamp(),
+    });
+    clearNeedsManualReauth(accountId);
+    addJobEvent(jobId, "success", `人工重登成功: ${account.email}`);
+    return {email: account.email, authFile: result.authFile};
+  } catch (error) {
+    if (error instanceof JobCancelledError) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    addJobEvent(jobId, "error", `人工重登失败: ${message}`);
+    throw error;
+  }
 }

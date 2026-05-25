@@ -301,6 +301,9 @@ function migrate(database: Database.Database): void {
   addColumnIfMissing(database, "accounts", "credential_source_service_id", "INTEGER");
   addColumnIfMissing(database, "accounts", "credential_source_remote_id", "TEXT");
   addColumnIfMissing(database, "accounts", "credential_synced_at", "TEXT");
+  addColumnIfMissing(database, "accounts", "needs_manual_reauth", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(database, "accounts", "last_reauth_attempt_at", "TEXT");
+  addColumnIfMissing(database, "accounts", "last_reauth_error", "TEXT");
   addColumnIfMissing(database, "auth_files", "credential_type", "TEXT NOT NULL DEFAULT 'codex_auth'");
   addColumnIfMissing(database, "auth_files", "current_step", "TEXT");
   addColumnIfMissing(database, "auth_files", "step_status", "TEXT");
@@ -442,6 +445,8 @@ function migrate(database: Database.Database): void {
         CREATE INDEX IF NOT EXISTS idx_credential_sync_events_service ON credential_sync_events(integration_service_id, id);
     `);
 
+  backfillPlatformBindings(database);
+
   addColumnIfMissing(database, "mail_sources", "mail_type_id", "INTEGER REFERENCES mail_types(id) ON DELETE SET NULL");
   addColumnIfMissing(database, "mail_sources", "vendor", "TEXT");
   addColumnIfMissing(database, "mail_sources", "batch_note", "TEXT");
@@ -468,7 +473,7 @@ function seedMailTypes(database: Database.Database): void {
   const timestamp = now();
   const rows = [
     ["hotmail_graph", "hotmail", "Hotmail / Outlook", "graph", "outlook.com, hotmail.com", 1, 1, 10],
-    ["hotmail_xiongmaodian", "hotmail", "Hotmail / 熊猫点", "xiongmaodian", "outlook.com, hotmail.com", 1, 1, 11],
+    ["hotmail_xiongmaodian", "hotmail", "Hotmail / 熊猫电竞", "xiongmaodian", "outlook.com, hotmail.com", 1, 1, 11],
     ["gmail", "gmail", "Gmail", null, "gmail.com", 1, 1, 20],
     ["gptmail", "gptmail", "GPTMail", null, "custom domain", 1, 1, 30],
     ["proxiedmail", "proxiedmail", "ProxiedMail", null, "proxiedmail", 1, 1, 40],
@@ -536,6 +541,20 @@ function addColumnIfMissing(database: Database.Database, table: string, column: 
     return;
   }
   database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function backfillPlatformBindings(database: Database.Database): void {
+  const timestamp = now();
+  database.prepare(`
+    INSERT OR IGNORE INTO account_platform_bindings (
+      account_id, integration_service_id, created_at, updated_at
+    )
+    SELECT DISTINCT af.account_id, af.credential_source_service_id, @timestamp, @timestamp
+    FROM auth_files af
+    JOIN integration_services s ON s.id = af.credential_source_service_id
+    WHERE af.credential_source_service_id IS NOT NULL
+      AND af.credential_source_kind IN ('cpa', 'sub2api')
+  `).run({timestamp});
 }
 
 export function upsertSetting(key: string, value: string): void {

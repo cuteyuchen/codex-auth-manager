@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import {computed, onMounted, reactive, ref, watch} from "vue";
 import {ElMessage, ElMessageBox} from "element-plus";
-import {Delete, Edit, Message, Plus, Refresh, Search, Upload} from "@element-plus/icons-vue";
-import {apiGet, apiSend, type LatestEmail, type Mailbox, type MailSource, type MailType} from "../api";
+import {Delete, Edit, Hide, Message, Plus, Refresh, Search, Upload, View} from "@element-plus/icons-vue";
+import {apiGet, apiSend, type LatestEmail, type Mailbox, type MailboxSecrets, type MailSource, type MailType} from "../api";
 
 const sources = ref<MailSource[]>([]);
 const types = ref<MailType[]>([]);
@@ -19,6 +19,7 @@ const latestEmail = ref<LatestEmail | null>(null);
 const fetchingMailbox = ref<Mailbox | null>(null);
 const currentPage = ref(1);
 const pageSize = ref(20);
+const loadingSecrets = ref(false);
 
 const filters = reactive({
   q: "",
@@ -61,8 +62,26 @@ const statuses = [
 
 const hotmailModes = [
   {label: "Outlook / Graph", value: "graph"},
-  {label: "熊猫点", value: "xiongmaodian"},
+  {label: "熊猫电竞", value: "xiongmaodian"},
 ];
+
+type MailboxSecretField = "password" | "client_id" | "refresh_token" | "access_token";
+
+const SECRET_FIELD_KEYS: MailboxSecretField[] = ["password", "client_id", "refresh_token", "access_token"];
+
+const revealedFields = reactive<Record<MailboxSecretField, boolean>>({
+  password: false,
+  client_id: false,
+  refresh_token: false,
+  access_token: false,
+});
+
+const fieldHadStoredValue = reactive<Record<MailboxSecretField, boolean>>({
+  password: false,
+  client_id: false,
+  refresh_token: false,
+  access_token: false,
+});
 
 const selectedImportSource = computed(() => sources.value.find((item) => item.id === importForm.source_id));
 const creatingSourceOnImport = computed(() => !importForm.source_id);
@@ -75,8 +94,6 @@ const selectedImportType = computed(() => selectedImportSource.value
 const mailboxFieldSchema = computed(() => fieldsForProvider(selectedMailboxProvider.value, selectedMailboxSource.value?.subtype));
 const importPlaceholder = computed(() => placeholderForType(selectedImportType.value));
 const latestEmailDocument = computed(() => buildEmailDocument(latestEmail.value));
-
-type MailboxSecretField = "password" | "client_id" | "refresh_token" | "access_token";
 
 function buildQuery() {
   const params = new URLSearchParams();
@@ -138,13 +155,49 @@ function resetMailboxForm() {
     status: "unused",
     used: false,
   });
+  resetSecretReveal();
+  for (const key of SECRET_FIELD_KEYS) {
+    fieldHadStoredValue[key] = false;
+  }
   mailboxDialog.value = true;
+}
+
+function resetSecretReveal() {
+  for (const key of SECRET_FIELD_KEYS) {
+    revealedFields[key] = false;
+  }
+}
+
+function isFieldMasked(key: MailboxSecretField): boolean {
+  return fieldHadStoredValue[key] && !revealedFields[key];
+}
+
+function fieldDisplayValue(key: MailboxSecretField): string {
+  const real = mailboxForm[key] ?? "";
+  if (!isFieldMasked(key) || !real) {
+    return real;
+  }
+  return "●".repeat(Math.min(real.length, 16));
+}
+
+function fieldInputType(key: string): string {
+  if (key === "refresh_token" || key === "access_token") {
+    return "textarea";
+  }
+  if (key === "password") {
+    return revealedFields.password ? "text" : "password";
+  }
+  return "text";
+}
+
+function toggleReveal(key: MailboxSecretField) {
+  revealedFields[key] = !revealedFields[key];
 }
 
 function fieldsForProvider(provider: string, subtype?: string | null) {
   if (provider === "hotmail") {
     if (subtype === "xiongmaodian") {
-      return [{key: "password", label: "邮箱密码", placeholder: "可选，熊猫点普通取件通常不需要"}];
+      return [{key: "password", label: "邮箱密码", placeholder: "可选，熊猫电竞普通取件通常不需要"}];
     }
     return [
       {key: "password", label: "邮箱密码", placeholder: "可选"},
@@ -201,7 +254,7 @@ function placeholderForType(type: MailType | undefined) {
   return "a@example.com\nb@example.com";
 }
 
-function editMailbox(row: Mailbox) {
+async function editMailbox(row: Mailbox) {
   editingMailboxId.value = row.id;
   Object.assign(mailboxForm, {
     source_id: row.source_id,
@@ -210,20 +263,45 @@ function editMailbox(row: Mailbox) {
     client_id: "",
     refresh_token: "",
     access_token: "",
-    status: row.status,
+    status: row.used ? "used" : row.status,
     used: Boolean(row.used),
   });
+  fieldHadStoredValue.password = Boolean(row.has_password);
+  fieldHadStoredValue.client_id = Boolean(row.has_client_id);
+  fieldHadStoredValue.refresh_token = Boolean(row.has_refresh_token);
+  fieldHadStoredValue.access_token = Boolean(row.has_access_token);
+  resetSecretReveal();
   mailboxDialog.value = true;
+  const needsFetch = SECRET_FIELD_KEYS.some((key) => fieldHadStoredValue[key]);
+  if (!needsFetch) {
+    return;
+  }
+  loadingSecrets.value = true;
+  try {
+    const {secrets} = await apiGet<{secrets: MailboxSecrets}>(`/api/mailboxes/${row.id}/secrets`);
+    mailboxForm.password = secrets.password || "";
+    mailboxForm.client_id = secrets.client_id || "";
+    mailboxForm.refresh_token = secrets.refresh_token || "";
+    mailboxForm.access_token = secrets.access_token || "";
+  } catch (error) {
+    ElMessage.warning(`读取已有敏感字段失败，编辑时若不重新输入将清空原值：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    loadingSecrets.value = false;
+  }
 }
 
 async function saveMailbox() {
   saving.value = true;
   try {
+    const payload = {
+      ...mailboxForm,
+      used: mailboxForm.status === "used",
+    };
     if (editingMailboxId.value) {
-      await apiSend(`/api/mailboxes/${editingMailboxId.value}`, "PUT", mailboxForm);
+      await apiSend(`/api/mailboxes/${editingMailboxId.value}`, "PUT", payload);
       ElMessage.success("邮箱已更新");
     } else {
-      await apiSend("/api/mailboxes", "POST", mailboxForm);
+      await apiSend("/api/mailboxes", "POST", payload);
       ElMessage.success("邮箱已创建");
     }
     mailboxDialog.value = false;
@@ -314,6 +392,20 @@ function statusType(status: string) {
 
 function statusLabel(status: string) {
   return statuses.find((item) => item.value === status)?.label || status;
+}
+
+function rowStatusType(row: Mailbox) {
+  if (row.used) {
+    return "info";
+  }
+  return statusType(row.status);
+}
+
+function rowStatusLabel(row: Mailbox) {
+  if (row.used) {
+    return "已使用";
+  }
+  return statusLabel(row.status);
 }
 
 function subtypeLabel(value: string | null | undefined) {
@@ -468,14 +560,9 @@ onMounted(load);
             </template>
           </el-table-column>
           <el-table-column prop="source_name" label="来源" min-width="160" show-overflow-tooltip />
-          <el-table-column label="状态" width="110">
+          <el-table-column label="状态" width="120">
             <template #default="{row}">
-              <el-tag :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="使用" width="96">
-            <template #default="{row}">
-              <el-tag :type="row.used ? 'info' : 'success'" effect="plain">{{ row.used ? "已使用" : "未使用" }}</el-tag>
+              <el-tag :type="rowStatusType(row)">{{ rowStatusLabel(row) }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="取件" min-width="145">
@@ -485,17 +572,6 @@ onMounted(load);
                   {{ row.supports_auto_code ? "自动取件" : "仅库存" }}
                 </el-tag>
                 <span class="text-xs text-[var(--app-muted)]">{{ row.last_code_status || "未测试" }} / {{ formatDate(row.last_code_at) }}</span>
-              </div>
-            </template>
-          </el-table-column>
-          <el-table-column label="敏感字段" min-width="210">
-            <template #default="{row}">
-              <div class="flex flex-wrap gap-1">
-                <el-tag v-if="row.has_password" size="small" effect="plain">密码</el-tag>
-                <el-tag v-if="row.has_client_id" size="small" effect="plain">client_id</el-tag>
-                <el-tag v-if="row.has_refresh_token" size="small" effect="plain">refresh_token</el-tag>
-                <el-tag v-if="row.has_access_token" size="small" effect="plain">access_token</el-tag>
-                <span v-if="!row.has_password && !row.has_client_id && !row.has_refresh_token && !row.has_access_token" class="text-slate-400">无</span>
               </div>
             </template>
           </el-table-column>
@@ -525,7 +601,7 @@ onMounted(load);
     </el-card>
 
     <el-dialog v-model="mailboxDialog" :title="editingMailboxId ? '编辑邮箱' : '添加邮箱'" width="680px">
-      <el-form label-position="top" :model="mailboxForm">
+      <el-form v-loading="loadingSecrets" element-loading-text="正在读取敏感字段..." label-position="top" :model="mailboxForm">
         <el-form-item label="来源">
           <el-select v-model="mailboxForm.source_id" filterable class="w-full">
             <el-option
@@ -541,32 +617,40 @@ onMounted(load);
           <template v-for="field in mailboxFieldSchema" :key="field.key">
             <el-form-item
               v-if="field.key !== 'email'"
-              :label="field.label"
               class="mb-0"
             >
+              <template #label>
+                <div class="flex w-full items-center justify-between gap-2">
+                  <span>{{ field.label }}</span>
+                  <el-button
+                    v-if="SECRET_FIELD_KEYS.includes(field.key as MailboxSecretField)"
+                    link size="small" type="primary"
+                    @click="toggleReveal(field.key as MailboxSecretField)"
+                  >
+                    <el-icon class="mr-1"><component :is="revealedFields[field.key as MailboxSecretField] ? Hide : View" /></el-icon>
+                    {{ revealedFields[field.key as MailboxSecretField] ? '隐藏' : '显示' }}
+                  </el-button>
+                </div>
+              </template>
               <el-input
-                :model-value="secretFieldValue(field.key)"
-                :type="field.key === 'refresh_token' || field.key === 'access_token' ? 'textarea' : field.key === 'password' ? 'password' : 'text'"
+                :model-value="SECRET_FIELD_KEYS.includes(field.key as MailboxSecretField)
+                  ? fieldDisplayValue(field.key as MailboxSecretField)
+                  : secretFieldValue(field.key)"
+                :type="fieldInputType(field.key)"
                 :rows="field.key === 'refresh_token' || field.key === 'access_token' ? 2 : undefined"
-                :show-password="field.key === 'password'"
+                :readonly="SECRET_FIELD_KEYS.includes(field.key as MailboxSecretField) && isFieldMasked(field.key as MailboxSecretField)"
                 :placeholder="field.placeholder"
                 @update:model-value="setSecretFieldValue(field.key, $event)"
               />
             </el-form-item>
           </template>
         </div>
-        <el-row :gutter="12">
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="状态">
-              <el-select v-model="mailboxForm.status" class="w-full">
-                <el-option v-for="item in statuses" :key="item.value" :label="item.label" :value="item.value" />
-              </el-select>
-            </el-form-item>
-          </el-col>
-          <el-col :xs="24" :sm="12">
-            <el-form-item label="使用状态"><el-switch v-model="mailboxForm.used" active-text="已使用" inactive-text="未使用" /></el-form-item>
-          </el-col>
-        </el-row>
+        <el-form-item label="状态">
+          <el-select v-model="mailboxForm.status" class="w-full">
+            <el-option v-for="item in statuses" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <div class="mt-1 text-xs text-[var(--app-muted)]">选择"已使用"后，该邮箱会从可用池中移除。</div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="mailboxDialog = false">取消</el-button>

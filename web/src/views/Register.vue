@@ -49,7 +49,7 @@ const uploadTargets = [
 ];
 const hotmailModes = [
   {label: "Outlook / Graph", value: "graph"},
-  {label: "熊猫点", value: "xiongmaodian"},
+  {label: "熊猫电竞", value: "xiongmaodian"},
 ];
 
 const emails = computed(() => form.emailText.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean));

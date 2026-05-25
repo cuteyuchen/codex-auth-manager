@@ -31,6 +31,7 @@ import {
 } from "./job-service.js";
 import {
   assertRegistrationSucceeded,
+  manualReauthAccount,
   reauthorizeAccount,
   runRegistrationJob,
   type RegisterOptions,
@@ -43,6 +44,7 @@ import {
   deleteMailType,
   deleteMailSource,
   fetchLatestMailboxEmail,
+  getMailboxSecrets,
   importMailboxes,
   listMailboxes,
   listMailTypes,
@@ -171,6 +173,10 @@ app.get("/api/dashboard", async () => {
 
 app.get("/api/accounts", async (request) => {
   const query = (request.query as Record<string, string> | undefined) ?? {};
+  const bindingServiceIds = String(query.bindingServiceIds ?? "")
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isFinite(value) && value > 0);
   return {accounts: listAccounts({
     q: query.q,
     status: query.status,
@@ -179,6 +185,7 @@ app.get("/api/accounts", async (request) => {
     plan: query.plan,
     autoReauth: query.autoReauth,
     pushStatus: query.pushStatus,
+    bindingServiceIds,
     page: Number(query.page ?? 1),
     pageSize: Number(query.pageSize ?? 200),
   })};
@@ -248,15 +255,26 @@ app.post("/api/accounts/:id/refresh", async (request) => {
 
 app.post("/api/accounts/:id/reauth", async (request) => {
   const id = Number((request.params as {id: string}).id);
+  const body = request.body as {mode?: "auto" | "manual"} | undefined;
+  const mode: "auto" | "manual" = body?.mode === "manual" ? "manual" : "auto";
   const account = getAccount(id);
-  const job = createJob("reauth", `重新授权 ${account.email}`, {id});
+  const job = createJob(`reauth_${mode}`, `${mode === "manual" ? "人工" : "自动"}重登 ${account.email}`, {id, mode});
   void runJob(job.id, async () => {
-    const result = await reauthorizeAccount(id, job.id);
+    if (mode === "manual") {
+      const result = await manualReauthAccount(id, job.id);
+      try {
+        await pushAccountToBoundPlatforms(id);
+        return {...result, mode, boundPlatformPush: "success"};
+      } catch (error) {
+        return {...result, mode, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)};
+      }
+    }
+    const result = await reauthorizeAccount(id, job.id, {mode: "auto"});
     try {
       await pushAccountToBoundPlatforms(id);
-      return {...result, boundPlatformPush: "success"};
+      return {...result, mode, boundPlatformPush: "success"};
     } catch (error) {
-      return {...result, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)};
+      return {...result, mode, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)};
     }
   }, {exclusiveRegister: true});
   return {job};
@@ -368,6 +386,9 @@ app.put("/api/mailboxes/:id", async (request) => ({
   mailbox: await updateMailbox(Number((request.params as {id: string}).id), (request.body ?? {}) as Record<string, unknown>),
 }));
 app.delete("/api/mailboxes/:id", async (request) => deleteMailbox(Number((request.params as {id: string}).id)));
+app.get("/api/mailboxes/:id/secrets", async (request) => ({
+  secrets: await getMailboxSecrets(Number((request.params as {id: string}).id)),
+}));
 app.post("/api/mailboxes/import", async (request) => importMailboxes((request.body ?? {}) as Record<string, unknown>));
 app.post("/api/mailboxes/:id/test-code", async (request) => testMailboxCode(Number((request.params as {id: string}).id)));
 app.post("/api/mailboxes/:id/fetch-latest", async (request) => fetchLatestMailboxEmail(Number((request.params as {id: string}).id)));
