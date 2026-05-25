@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import {computed, nextTick, onBeforeUnmount, onMounted, ref, watch} from "vue";
+import {computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch} from "vue";
 import {ElMessage} from "element-plus";
 import {CircleClose, Promotion, Refresh} from "@element-plus/icons-vue";
 import {apiGet, apiSend, type Job, type JobEvent} from "../api";
+import {applyRegisterStatsEvent, applyRegisterJobResult, buildRegisterStatsFromEvents, createRegisterStats} from "../registerStats";
 
 const jobs = ref<Job[]>([]);
 const events = ref<JobEvent[]>([]);
@@ -13,10 +14,12 @@ const pageSize = ref(20);
 const logBoxRef = ref<HTMLElement | null>(null);
 const stickToBottom = ref(true);
 const cancelling = ref(false);
+const registerStats = reactive(createRegisterStats());
 let source: EventSource | null = null;
 
 const pagedJobs = computed(() => jobs.value.slice((currentPage.value - 1) * pageSize.value, currentPage.value * pageSize.value));
 const activeSelectedJob = computed(() => selectedJob.value ? isActiveJob(selectedJob.value) : false);
+const selectedJobIsRegister = computed(() => selectedJob.value?.type === "register");
 
 async function load() {
   try {
@@ -36,11 +39,13 @@ async function load() {
 async function selectJob(job: Job) {
   selectedJob.value = job;
   events.value = [];
+  resetRegisterStats();
   if (source) {
     source.close();
   }
   const payload = await apiGet<{events: JobEvent[]}>(`/api/jobs/${job.id}/events`);
   events.value = payload.events;
+  Object.assign(registerStats, buildRegisterStatsFromEvents(payload.events, job));
   stickToBottom.value = true;
   source = new EventSource(`/api/jobs/${job.id}/stream`);
   source.onmessage = (message) => {
@@ -51,10 +56,15 @@ async function selectJob(job: Job) {
     }
     if (event.id > 0 && !events.value.some((item) => item.id === event.id)) {
       events.value.push(event);
+      applyRegisterStatsEvent(registerStats, event.message);
       void scrollLogToBottom();
     }
   };
   void scrollLogToBottom(true);
+}
+
+function resetRegisterStats() {
+  Object.assign(registerStats, createRegisterStats());
 }
 
 function handleLogScroll() {
@@ -111,6 +121,7 @@ function applyJobUpdate(job: Job) {
   jobs.value = jobs.value.map((item) => item.id === job.id ? job : item);
   if (selectedJob.value?.id === job.id) {
     selectedJob.value = job;
+    applyRegisterJobResult(registerStats, job);
   }
 }
 
@@ -209,6 +220,28 @@ watch(() => events.value.length, () => {
           <div v-if="selectedJob?.waiting_for_input" class="mb-3 flex gap-2">
             <el-input v-model="inputValue" :placeholder="selectedJob.input_prompt || '输入验证码'" @keyup.enter="submitInput" />
             <el-button :icon="Promotion" type="primary" @click="submitInput">提交</el-button>
+          </div>
+          <div v-if="selectedJobIsRegister" class="mb-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">进度</div>
+              <div class="mt-1 text-lg font-semibold">{{ registerStats.completed }} / {{ registerStats.total || "-" }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">成功</div>
+              <div class="mt-1 text-lg font-semibold text-emerald-600">{{ registerStats.success }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">失败</div>
+              <div class="mt-1 text-lg font-semibold text-rose-600">{{ registerStats.failed }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">短信号码</div>
+              <div class="mt-1 text-lg font-semibold">{{ registerStats.smsNumbersUsed }}</div>
+            </div>
+            <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
+              <div class="text-xs text-[var(--app-muted)]">短信成功</div>
+              <div class="mt-1 text-lg font-semibold">{{ registerStats.smsSuccessCount }}</div>
+            </div>
           </div>
           <div ref="logBoxRef" class="log-box" @scroll="handleLogScroll">
             <div v-for="event in events" :key="event.id" class="log-line" :class="event.level">

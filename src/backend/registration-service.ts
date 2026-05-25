@@ -29,8 +29,12 @@ import {
   setMailboxLastError,
 } from "./mailbox-service.js";
 import {MAILBOX_CONFIG} from "../core/mailbox.js";
-import {saveAuthFileJsonObjectToCLIProxyAPI} from "../core/cliproxyapi.js";
-import {uploadAuthFileToSub2API} from "../core/sub2api.js";
+import {
+  resolvePushServices,
+  saveAuthFileJsonObjectToCPAService,
+  uploadAuthFileToSub2APIService,
+  type PushServiceConfig,
+} from "./integration-service.js";
 
 const OPENAI_PASSWORD_MIN_LENGTH = 8;
 type UploadTarget = "none" | "cpa" | "sub2api" | "both";
@@ -59,7 +63,7 @@ export interface RegisterResult {
     success: number;
     failed: number;
     smsNumbersUsed: number;
-    smsActivationsCompleted: number;
+    smsSuccessCount: number;
     emails: string[];
     failedEmails: string[];
 }
@@ -67,7 +71,7 @@ export interface RegisterResult {
 interface SingleRegistrationResult {
     email: string;
     smsNumbersUsed: number;
-    smsActivationsCompleted: number;
+    smsSuccessCount: number;
 }
 
 function createBroker() {
@@ -91,15 +95,15 @@ function createBrokerForRegistration(options: RegisterOptions) {
   return createBroker();
 }
 
-function summarizeSmsBrokerUsage(broker: unknown): {smsNumbersUsed: number; smsActivationsCompleted: number} {
-  const reader = broker as {getHistory?: () => {phoneStats?: Record<string, unknown>; totalCompletedActivations?: number}} | undefined;
+function summarizeSmsBrokerUsage(broker: unknown): {smsNumbersUsed: number; smsSuccessCount: number} {
+  const reader = broker as {getHistory?: () => {phoneStats?: Record<string, unknown>; totalAttemptsSucceeded?: number}} | undefined;
   if (typeof reader?.getHistory !== "function") {
-    return {smsNumbersUsed: 0, smsActivationsCompleted: 0};
+    return {smsNumbersUsed: 0, smsSuccessCount: 0};
   }
   const history = reader.getHistory();
   return {
     smsNumbersUsed: Object.keys(history.phoneStats ?? {}).length,
-    smsActivationsCompleted: Number(history.totalCompletedActivations ?? 0),
+    smsSuccessCount: Number(history.totalAttemptsSucceeded ?? 0),
   };
 }
 
@@ -167,35 +171,66 @@ async function pushAuthFileAfterRegistration(authFile: string | undefined, targe
   const record = await loadAuthRecord(authFile);
   const fileName = authFile.split(/[\\/]/).pop() || "auth.json";
   if (normalizedTarget === "cpa" || normalizedTarget === "both") {
-    try {
-      await saveAuthFileJsonObjectToCLIProxyAPI(fileName, record as unknown as Record<string, unknown>);
-      console.log(`cliproxyApiAuthUploaded: ${fileName}`);
-      if (jobId) {
-        addJobEvent(jobId, "success", `已上传 CPA: ${fileName}`);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    const services = await resolvePushServices("cpa");
+    if (!services.length) {
+      const message = "未配置启用的 CPA 推送服务";
       console.warn(`cliproxyApiAuthUploadFailed: ${fileName} error=${message}`);
       if (jobId) {
         addJobEvent(jobId, "error", `CPA 自动上传失败: ${fileName} ${message}`);
       }
     }
+    for (const service of services) {
+      try {
+        await saveAuthFileJsonObjectToCPAService({
+          baseUrl: service.baseUrl,
+          managementKey: service.secret,
+        }, fileName, record as unknown as Record<string, unknown>);
+        console.log(`cliproxyApiAuthUploaded: ${fileName} service=${formatPushServiceName(service)}`);
+        if (jobId) {
+          addJobEvent(jobId, "success", `已上传 CPA: 服务=${formatPushServiceName(service)} 文件=${fileName}`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`cliproxyApiAuthUploadFailed: ${fileName} service=${formatPushServiceName(service)} error=${message}`);
+        if (jobId) {
+          addJobEvent(jobId, "error", `CPA 自动上传失败: 服务=${formatPushServiceName(service)} 文件=${fileName} ${message}`);
+        }
+      }
+    }
   }
   if (normalizedTarget === "sub2api" || normalizedTarget === "both") {
-    try {
-      const result = await uploadAuthFileToSub2API(fileName, record as SavedAuthRecord);
-      console.log(`sub2apiAuthUploaded: ${fileName} created=${result.created} updated=${result.updated} skipped=${result.skipped}`);
-      if (jobId) {
-        addJobEvent(jobId, "success", `已上传 Sub2API: ${fileName}`);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    const services = await resolvePushServices("sub2api");
+    if (!services.length) {
+      const message = "未配置启用的 Sub2API 推送服务";
       console.warn(`sub2apiAuthUploadFailed: ${fileName} error=${message}`);
       if (jobId) {
         addJobEvent(jobId, "error", `Sub2API 自动上传失败: ${fileName} ${message}`);
       }
     }
+    for (const service of services) {
+      try {
+        const result = await uploadAuthFileToSub2APIService({
+          baseUrl: service.baseUrl,
+          adminApiKey: service.secret,
+          options: service.options,
+        }, fileName, record as SavedAuthRecord);
+        console.log(`sub2apiAuthUploaded: ${fileName} service=${formatPushServiceName(service)} created=${result.created} updated=${result.updated} skipped=${result.skipped}`);
+        if (jobId) {
+          addJobEvent(jobId, "success", `已上传 Sub2API: 服务=${formatPushServiceName(service)} 文件=${fileName} created=${result.created} updated=${result.updated} skipped=${result.skipped}`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`sub2apiAuthUploadFailed: ${fileName} service=${formatPushServiceName(service)} error=${message}`);
+        if (jobId) {
+          addJobEvent(jobId, "error", `Sub2API 自动上传失败: 服务=${formatPushServiceName(service)} 文件=${fileName} ${message}`);
+        }
+      }
+    }
   }
+}
+
+function formatPushServiceName(service: PushServiceConfig): string {
+  return `${service.name}${service.fallback ? "(全局配置)" : ""}`;
 }
 
 function resolveRegistrationPassword(input?: string): string {
@@ -400,7 +435,7 @@ async function waitBetweenRegistrationRounds(jobId: number | undefined, delayMs:
     return;
   }
   const seconds = Math.ceil(normalizedDelayMs / 1000);
-  console.log(`[循环间隔] 等待 ${seconds}s 后开始第 ${nextRound} 轮`);
+  console.log(`[延迟] 轮次间等待 ${seconds}s，之后开始第 ${nextRound} 轮`);
   const deadline = Date.now() + normalizedDelayMs;
   while (Date.now() < deadline) {
     throwIfJobCancelled(jobId);
@@ -443,7 +478,7 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
   let success = 0;
   let failed = 0;
   let smsNumbersUsed = 0;
-  let smsActivationsCompleted = 0;
+  let smsSuccessCount = 0;
   const successEmails: string[] = [];
   const failedEmails: string[] = [];
 
@@ -458,12 +493,13 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
     }
 
     const targetEmail = emails[index] ?? "";
-    console.log(`第 ${index + 1} 轮开始: ${targetEmail || "自动邮箱"}`);
+    const modeLabel = usesMailboxPool ? "邮箱池" : (targetEmail ? "指定邮箱" : "自动邮箱");
+    console.log(`第 ${index + 1} 轮开始: 成功=${success} 失败=${failed} 模式=${modeLabel}`);
     try {
       const result = await runSingleRegistration(options, targetEmail);
       success += 1;
       smsNumbersUsed += result.smsNumbersUsed;
-      smsActivationsCompleted += result.smsActivationsCompleted;
+      smsSuccessCount += result.smsSuccessCount;
       successEmails.push(result.email);
     } catch (error) {
       rethrowIfCancellation(error, options);
@@ -472,17 +508,22 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
       failedEmails.push(targetEmail || "auto");
       console.error(`[授权失败] ${targetEmail || "auto"} ${message}`);
     }
-    console.log(`[任务统计] 总轮数 ${maxRounds}，已完成 ${index + 1}，成功 ${success}，失败 ${failed}，短信使用号码 ${smsNumbersUsed}，短信成功激活 ${smsActivationsCompleted}`);
+    console.log(`[任务统计] 总轮数 ${maxRounds}，已完成 ${index + 1}，成功 ${success}，失败 ${failed}，短信号码 ${smsNumbersUsed}，短信成功 ${smsSuccessCount}`);
     if (index < maxRounds - 1) {
       await waitBetweenRegistrationRounds(options.jobId, appConfig.loopDelayMs, index + 2);
     }
   }
 
+  const completed = success + failed;
+  console.log(`自动模式结束: 已执行=${completed} 成功=${success} 失败=${failed} 短信号码=${smsNumbersUsed} 短信成功=${smsSuccessCount}`);
+  console.log(`成功邮箱(${successEmails.length}): ${successEmails.length ? successEmails.join(", ") : "无"}`);
+  console.log(`失败邮箱(${failedEmails.length}): ${failedEmails.length ? failedEmails.join(", ") : "无"}`);
+
   return {
     success,
     failed,
     smsNumbersUsed,
-    smsActivationsCompleted,
+    smsSuccessCount,
     emails: successEmails,
     failedEmails,
   };

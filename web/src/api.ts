@@ -93,6 +93,9 @@ export interface Job {
     type: string;
     status: string;
     title: string;
+    payload_json?: string;
+    result_json?: string | null;
+    result?: Record<string, unknown> | null;
     error: string | null;
     waiting_for_input: number;
     input_prompt: string | null;

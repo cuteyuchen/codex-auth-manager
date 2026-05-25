@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {readFile, writeFile} from "node:fs/promises";
 import path from "node:path";
+import {Agent, fetch as undiciFetch} from "undici";
 import {appConfig} from "../config.js";
 import {appendErrorEmail} from "../email-error-recorder.js";
 import {nextHotmailEmailEntry} from "./hotmail-email-queue.js";
@@ -24,6 +25,31 @@ const HOTMAIL_MESSAGE_FETCH_LIMIT = 10;
 const HOTMAIL_FOLDER_IDS = ["inbox", "junkemail"];
 const aliasAccountMap = new Map();
 let accountCache = null;
+let cachedDispatcher = null;
+
+function getHotmailDispatcher() {
+  if (!cachedDispatcher) {
+    cachedDispatcher = new Agent({connect: {rejectUnauthorized: false}});
+  }
+  return cachedDispatcher;
+}
+
+async function hotmailFetch(input, init = {}) {
+  try {
+    return await undiciFetch(input, {
+      ...init,
+      dispatcher: getHotmailDispatcher(),
+    });
+  } catch (error) {
+    const cause = error?.cause;
+    const causeMessage = cause instanceof Error ? cause.message : (cause ? String(cause) : "");
+    const baseMessage = error instanceof Error ? error.message : String(error);
+    const merged = causeMessage && causeMessage !== baseMessage
+      ? `${baseMessage}: ${causeMessage}`
+      : baseMessage;
+    throw new Error(`Hotmail 请求网络异常: ${merged}`);
+  }
+}
 
 function normalizeApiMode(value) {
   const mode = String(value ?? "").toLowerCase();
@@ -341,7 +367,7 @@ async function refreshAccessToken(account) {
       body.set("scope", variant.scope);
     }
 
-    const response = await fetch(HOTMAIL_OAUTH_TOKEN_URL, {
+    const response = await hotmailFetch(HOTMAIL_OAUTH_TOKEN_URL, {
       method: "POST",
       headers: {
         Accept: "application/json",
@@ -442,7 +468,7 @@ async function listFolderMessages(account, folderId) {
       url.searchParams.set("$select", "id,subject,bodyPreview,body,from,toRecipients,receivedDateTime");
     }
 
-    const response = await fetch(url, {
+    const response = await hotmailFetch(url, {
       method: "GET",
       headers: buildAuthHeaders(account),
     });

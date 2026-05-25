@@ -288,7 +288,7 @@ onMounted(load);
                 </el-form-item>
               </el-col>
               <el-col :span="12">
-                <el-form-item label="循环间隔 s"><el-input-number v-model="loopDelaySeconds" :min="0" class="w-full" /></el-form-item>
+                <el-form-item label="循环间隔（秒）"><el-input-number v-model="loopDelaySeconds" :min="0" class="w-full" /></el-form-item>
               </el-col>
             </el-row>
           </el-form>

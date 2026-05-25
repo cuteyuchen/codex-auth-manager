@@ -3,6 +3,7 @@ import {computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch} fr
 import {ElMessage} from "element-plus";
 import {CircleClose, Promotion, Refresh, VideoPlay} from "@element-plus/icons-vue";
 import {apiGet, apiSend, type Job, type JobEvent, type MailSource, type MailType} from "../api";
+import {applyRegisterStatsEvent, createRegisterStats} from "../registerStats";
 
 const types = ref<MailType[]>([]);
 const sources = ref<MailSource[]>([]);
@@ -31,14 +32,7 @@ const form = reactive({
   uploadTarget: "none",
 });
 
-const stats = reactive({
-  total: 0,
-  completed: 0,
-  success: 0,
-  failed: 0,
-  smsNumbersUsed: 0,
-  smsActivationsCompleted: 0,
-});
+const stats = reactive(createRegisterStats());
 
 const registerModes = [
   {label: "注册并授权", value: "sign"},
@@ -68,27 +62,7 @@ const currentStage = computed(() => {
 });
 
 function resetStats() {
-  Object.assign(stats, {
-    total: 0,
-    completed: 0,
-    success: 0,
-    failed: 0,
-    smsNumbersUsed: 0,
-    smsActivationsCompleted: 0,
-  });
-}
-
-function updateStatsFromEvent(message: string) {
-  const match = message.match(/总轮数\s+(\d+)，已完成\s+(\d+)，成功\s+(\d+)，失败\s+(\d+)，短信使用号码\s+(\d+)，短信成功激活\s+(\d+)/);
-  if (!match) {
-    return;
-  }
-  stats.total = Number(match[1]);
-  stats.completed = Number(match[2]);
-  stats.success = Number(match[3]);
-  stats.failed = Number(match[4]);
-  stats.smsNumbersUsed = Number(match[5]);
-  stats.smsActivationsCompleted = Number(match[6]);
+  Object.assign(stats, createRegisterStats());
 }
 
 function updateLogStickiness() {
@@ -112,7 +86,7 @@ function appendEvent(event: JobEvent) {
     return;
   }
   const shouldFollow = stickToLatestLog.value;
-  updateStatsFromEvent(event.message);
+  applyRegisterStatsEvent(stats, event.message);
   events.value.push(event);
   if (event.message.startsWith("请输入")) {
     waitingPrompt.value = event.message;
@@ -451,7 +425,7 @@ onBeforeUnmount(() => source?.close());
             </div>
             <div class="rounded-lg border border-[var(--app-border)] bg-[var(--app-surface-soft)] px-3 py-2">
               <div class="text-xs text-[var(--app-muted)]">短信成功</div>
-              <div class="mt-1 text-lg font-semibold">{{ stats.smsActivationsCompleted }}</div>
+              <div class="mt-1 text-lg font-semibold">{{ stats.smsSuccessCount }}</div>
             </div>
           </div>
         </el-card>

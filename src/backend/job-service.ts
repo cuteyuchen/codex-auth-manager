@@ -47,11 +47,29 @@ export function getJob(id: number): JobRow {
   if (!row) {
     throw new Error(`任务不存在: ${id}`);
   }
-  return row;
+  return normalizeJobRow(row);
 }
 
 export function listJobs(limit = 100): JobRow[] {
-  return getDb().prepare("SELECT * FROM jobs ORDER BY id DESC LIMIT ?").all(limit) as JobRow[];
+  return (getDb().prepare("SELECT * FROM jobs ORDER BY id DESC LIMIT ?").all(limit) as JobRow[]).map(normalizeJobRow);
+}
+
+function normalizeJobRow(row: JobRow): JobRow & {result: Record<string, unknown> | null} {
+  return {
+    ...row,
+    result: parseJobJson(row.result_json),
+  };
+}
+
+function parseJobJson(value: string | null): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 export function listJobEvents(jobId: number, afterId = 0): JobEventRow[] {
