@@ -6,6 +6,8 @@ import {getConfigForUi, updateConfigFromUi} from "./config-service.js";
 import {
   checkAccount,
   dashboardStats,
+  deleteAccount,
+  bulkDeleteAccounts,
   exportAccountsAuthZip,
   getAccount,
   importAuthFiles,
@@ -219,6 +221,17 @@ app.get("/api/accounts/:id/auth-file", async (request, reply) => {
     .type("application/json; charset=utf-8")
     .header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(auth.fileName)}`)
     .send(auth.content);
+});
+
+app.delete("/api/accounts/:id", async (request) => {
+  const id = Number((request.params as {id: string}).id);
+  const body = request.body as {deleteFromServiceIds?: number[]} | undefined;
+  return deleteAccount(id, {deleteFromServiceIds: body?.deleteFromServiceIds});
+});
+
+app.post("/api/accounts/bulk-delete", async (request) => {
+  const body = request.body as {ids?: number[]; deleteFromServiceIds?: number[]} | undefined;
+  return bulkDeleteAccounts(body?.ids ?? [], {deleteFromServiceIds: body?.deleteFromServiceIds});
 });
 
 app.post("/api/accounts/export-auth", async (request, reply) => {

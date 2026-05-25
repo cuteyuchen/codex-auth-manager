@@ -12,7 +12,9 @@ import {buildZip, type ZipEntry} from "./zip.js";
 import {
   resolvePushServices,
   saveAuthFileJsonObjectToCPAService,
+  deleteAuthFileFromCPAService,
   uploadAuthFileToSub2APIService,
+  deleteAccountFromSub2APIService,
 } from "./integration-service.js";
 import {
   listAccountPlatformBindings,
@@ -1229,6 +1231,121 @@ export async function readAccountAuthFile(accountId: number): Promise<{fileName:
     fileName: authFile.file_name,
     content,
   };
+}
+
+export interface DeleteAccountOptions {
+    deleteFromServiceIds?: number[];
+}
+
+export interface DeleteAccountResult {
+    deleted: boolean;
+    email: string;
+    platformErrors: Array<{serviceId: number; serviceName: string; kind: string; message: string}>;
+    platformDeleted: Array<{serviceId: number; serviceName: string; kind: string}>;
+}
+
+async function deletePlatformRecordsForAccount(
+  accountId: number,
+  serviceIds: number[],
+): Promise<{deleted: DeleteAccountResult["platformDeleted"]; errors: DeleteAccountResult["platformErrors"]}> {
+  const deleted: DeleteAccountResult["platformDeleted"] = [];
+  const errors: DeleteAccountResult["platformErrors"] = [];
+  if (!serviceIds.length) {
+    return {deleted, errors};
+  }
+  const placeholders = serviceIds.map((_, index) => `@id${index}`).join(",");
+  const params: Record<string, number> = {};
+  serviceIds.forEach((value, index) => {
+    params[`id${index}`] = value;
+  });
+  const rows = getDb().prepare(`
+    SELECT af.credential_source_service_id AS serviceId,
+           af.credential_source_remote_id AS remoteId,
+           af.file_name AS fileName,
+           s.kind AS kind,
+           s.name AS serviceName
+    FROM auth_files af
+    JOIN integration_services s ON s.id = af.credential_source_service_id
+    WHERE af.account_id = @accountId
+      AND af.credential_source_service_id IN (${placeholders})
+  `).all({...params, accountId}) as Array<{serviceId: number; remoteId: string | null; fileName: string; kind: string; serviceName: string}>;
+  const requested = new Set(serviceIds);
+  const handledServices = new Set<number>();
+  for (const row of rows) {
+    handledServices.add(row.serviceId);
+    try {
+      const services = await resolvePushServices(row.kind as "cpa" | "sub2api", [row.serviceId]);
+      const service = services[0];
+      if (!service) {
+        throw new Error("平台服务不存在或已禁用");
+      }
+      if (row.kind === "cpa") {
+        await deleteAuthFileFromCPAService({baseUrl: service.baseUrl, managementKey: service.secret}, row.fileName);
+      } else if (row.kind === "sub2api") {
+        const remote = (row.remoteId ?? "").trim();
+        if (!remote) {
+          throw new Error("Sub2API 缺少 remoteId，无法精准删除");
+        }
+        await deleteAccountFromSub2APIService({baseUrl: service.baseUrl, adminApiKey: service.secret, options: service.options}, remote);
+      } else {
+        throw new Error(`未支持的平台类型: ${row.kind}`);
+      }
+      deleted.push({serviceId: row.serviceId, serviceName: row.serviceName, kind: row.kind});
+    } catch (error) {
+      errors.push({
+        serviceId: row.serviceId,
+        serviceName: row.serviceName,
+        kind: row.kind,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  for (const id of requested) {
+    if (handledServices.has(id)) {
+      continue;
+    }
+    const service = getDb().prepare("SELECT kind, name FROM integration_services WHERE id = ?").get(id) as {kind: string; name: string} | undefined;
+    errors.push({
+      serviceId: id,
+      serviceName: service?.name ?? String(id),
+      kind: service?.kind ?? "",
+      message: "本地未记录该平台上的远端 ID，无法删除",
+    });
+  }
+  return {deleted, errors};
+}
+
+export async function deleteAccount(accountId: number, options: DeleteAccountOptions = {}): Promise<DeleteAccountResult> {
+  const account = getAccount(accountId);
+  const serviceIds = [...new Set((options.deleteFromServiceIds ?? []).map(Number).filter((v) => Number.isFinite(v) && v > 0))];
+  const {deleted, errors} = await deletePlatformRecordsForAccount(accountId, serviceIds);
+  getDb().prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
+  return {
+    deleted: true,
+    email: account.email,
+    platformDeleted: deleted,
+    platformErrors: errors,
+  };
+}
+
+export async function bulkDeleteAccounts(
+  ids: number[],
+  options: DeleteAccountOptions = {},
+): Promise<{total: number; deleted: number; failures: Array<{id: number; message: string}>; perAccount: Array<{id: number; email: string; platformErrors: DeleteAccountResult["platformErrors"]; platformDeleted: DeleteAccountResult["platformDeleted"]}>}> {
+  const uniqueIds = [...new Set(ids.map(Number).filter((v) => Number.isFinite(v) && v > 0))];
+  const failures: Array<{id: number; message: string}> = [];
+  const perAccount: Array<{id: number; email: string; platformErrors: DeleteAccountResult["platformErrors"]; platformDeleted: DeleteAccountResult["platformDeleted"]}> = [];
+  let deleted = 0;
+  for (const id of uniqueIds) {
+    try {
+      const result = await deleteAccount(id, options);
+      deleted += 1;
+      perAccount.push({id, email: result.email, platformErrors: result.platformErrors, platformDeleted: result.platformDeleted});
+    } catch (error) {
+      failures.push({id, message: error instanceof Error ? error.message : String(error)});
+    }
+  }
+  return {total: uniqueIds.length, deleted, failures, perAccount};
 }
 
 export async function exportAccountsAuthZip(accountIds: number[]): Promise<{fileName: string; content: Buffer; count: number}> {

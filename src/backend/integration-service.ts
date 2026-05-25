@@ -359,6 +359,23 @@ export async function saveAuthFileJsonObjectToCPAService(
   }
 }
 
+export async function deleteAuthFileFromCPAService(
+  config: CLIProxyAPIConfig,
+  fileName: string,
+): Promise<void> {
+  const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/v0/management/auth-files`, {
+    method: "DELETE",
+    headers: createManagementHeaders(config, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({names: [fileName]}),
+  });
+  const rawBody = await response.text();
+  if (!response.ok) {
+    throw new Error(`CPA 删除 auth 失败: ${response.status} body=${rawBody}`);
+  }
+}
+
 async function testCPAConnection(config: CLIProxyAPIConfig): Promise<{success: boolean; message: string}> {
   const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/v0/management/auth-files`, {
     method: "GET",
@@ -470,6 +487,26 @@ export async function uploadAuthFileToSub2APIService(
     throw new Error(`Sub2API 导入失败: failed=${uploadResult.failed}${summarizeImportErrors(result)}`);
   }
   return uploadResult;
+}
+
+export async function deleteAccountFromSub2APIService(
+  config: Sub2APIConfig,
+  remoteId: string,
+): Promise<void> {
+  if (!remoteId) {
+    throw new Error("Sub2API 删除缺少 remoteId");
+  }
+  const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/api/v1/admin/accounts/${encodeURIComponent(remoteId)}`, {
+    method: "DELETE",
+    headers: {
+      Accept: "application/json",
+      "x-api-key": config.adminApiKey,
+    },
+  });
+  const rawBody = await response.text();
+  if (!response.ok) {
+    throw new Error(`Sub2API 删除账号失败: ${response.status} body=${rawBody.slice(0, 200)}`);
+  }
 }
 
 async function testSub2APIConnection(config: Sub2APIConfig): Promise<{success: boolean; message: string}> {
