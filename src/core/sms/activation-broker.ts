@@ -6,7 +6,7 @@ import type {
 } from "./provider.js";
 
 const ACTIVATION_CANCEL_AND_WITHDRAW_MIN_AGE_MS = 2 * 60 * 1000;
-const ACTIVATION_DEFERRED_CANCEL_MS = 3 * 60 * 1000;
+const ACTIVATION_DEFERRED_CANCEL_MS = 125 * 1000;
 
 export type ActivationAttemptOutcome = "success" | "failed";
 

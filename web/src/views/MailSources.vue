@@ -311,6 +311,20 @@ watch(pageSize, () => {
           <el-select v-model="form.hotmailSubtype" class="w-full" @change="syncProviderType">
             <el-option v-for="mode in hotmailModes" :key="mode.value" :label="mode.label" :value="mode.value" />
           </el-select>
+          <div v-if="form.hotmailSubtype === 'xiongmaodian'"
+               class="mt-2 rounded-md border border-[var(--el-border-color-light)] bg-[var(--el-fill-color-lighter)] px-3 py-2 text-xs text-[var(--el-text-color-regular)]">
+            <div class="font-medium text-[var(--el-text-color-primary)]">熊猫电竞（不是广告）</div>
+            <div class="mt-1">
+              【淘宝】<a href="https://e.tb.cn/h.Rf5RE2RhtPctcFc?tk=rEGL5woAq5P MF168"
+                       target="_blank" rel="noopener noreferrer"
+                       class="text-[var(--el-color-primary)] hover:underline">
+              https://e.tb.cn/h.Rf5RE2RhtPctcFc?tk=rEGL5woAq5P MF168 ↗
+              </a>
+            </div>
+            <div class="mt-1 text-[var(--el-text-color-secondary)]">
+              「微软邮箱 hotmail / outlook / 微软 Graph 令牌号 / Xbox 微软令牌号」
+            </div>
+          </div>
         </el-form-item>
         <el-row :gutter="12">
           <el-col :xs="24" :sm="12">

@@ -10,6 +10,7 @@ import {
   bulkDeleteAccounts,
   exportAccountsAuthZip,
   getAccount,
+  getAccountPassword,
   importAuthFiles,
   listAccounts,
   mapWithConcurrency,
@@ -259,6 +260,20 @@ app.post("/api/accounts/:id/check", async (request) => {
   const id = Number((request.params as {id: string}).id);
   const body = request.body as {refresh?: boolean} | undefined;
   return checkAccount(id, Boolean(body?.refresh));
+});
+
+app.get("/api/accounts/:id/password", async (request) => {
+  const id = Number((request.params as {id: string}).id);
+  const account = getAccount(id);
+  if (!account.password_encrypted) {
+    return {hasPassword: false, password: ""};
+  }
+  try {
+    const password = await getAccountPassword(account);
+    return {hasPassword: true, password};
+  } catch (error) {
+    return {hasPassword: false, password: "", error: error instanceof Error ? error.message : String(error)};
+  }
 });
 
 app.post("/api/accounts/:id/refresh", async (request) => {

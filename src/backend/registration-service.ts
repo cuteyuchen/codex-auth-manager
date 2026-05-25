@@ -12,6 +12,7 @@ import {
 } from "../core/mail/hotmail-email-queue.js";
 import {OpenAIClient, type SavedAuthRecord} from "../core/openai.js";
 import {createSMSBroker} from "../core/sms/index.js";
+import type {ISMSActivationBroker} from "../core/sms/activation-broker.js";
 import {getAccount, getAccountPassword, setAccountPassword, upsertAccountFromAuthRecord, loadAuthRecord, updateAuthFileStep} from "./auth-service.js";
 import {
   JobCancelledError,
@@ -36,6 +37,7 @@ import {
   uploadAuthFileToSub2APIService,
   type PushServiceConfig,
 } from "./integration-service.js";
+import {ensureAccountPlatformBinding} from "./account-platform-binding-service.js";
 
 const OPENAI_PASSWORD_MIN_LENGTH = 8;
 type UploadTarget = "none" | "cpa" | "sub2api" | "both";
@@ -153,18 +155,43 @@ async function removeSuccessfulEmail(email: string): Promise<void> {
   }
 }
 
-async function importAuthFileFromResult(authFile?: string, password?: string): Promise<void> {
+async function importAuthFileFromResult(
+  authFile?: string,
+  password?: string,
+  options: {sourceId?: number | null; mailboxId?: number | null} = {},
+): Promise<{accountId: number; email: string} | null> {
   if (!authFile) {
-    return;
+    return null;
   }
   const record = await loadAuthRecord(authFile);
   const account = await upsertAccountFromAuthRecord(record, authFile);
   if (password) {
     await setAccountPassword(account.id, password);
   }
+  if (options.sourceId != null || options.mailboxId != null) {
+    const updateFields: string[] = [];
+    const params: Record<string, unknown> = {id: account.id, updated_at: currentTimestamp()};
+    if (options.sourceId != null) {
+      updateFields.push("source_id = @source_id");
+      params.source_id = options.sourceId;
+    }
+    if (options.mailboxId != null) {
+      updateFields.push("mailbox_id = @mailbox_id");
+      params.mailbox_id = options.mailboxId;
+    }
+    if (updateFields.length) {
+      getDb().prepare(`UPDATE accounts SET ${updateFields.join(", ")}, updated_at = @updated_at WHERE id = @id`).run(params);
+    }
+  }
+  return {accountId: account.id, email: account.email};
 }
 
-async function pushAuthFileAfterRegistration(authFile: string | undefined, target: UploadTarget | undefined, jobId?: number): Promise<void> {
+async function pushAuthFileAfterRegistration(
+  authFile: string | undefined,
+  target: UploadTarget | undefined,
+  jobId?: number,
+  accountId?: number,
+): Promise<void> {
   const normalizedTarget = target ?? "none";
   if (!authFile || normalizedTarget === "none") {
     return;
@@ -189,6 +216,16 @@ async function pushAuthFileAfterRegistration(authFile: string | undefined, targe
         console.log(`cliproxyApiAuthUploaded: ${fileName} service=${formatPushServiceName(service)}`);
         if (jobId) {
           addJobEvent(jobId, "success", `已上传 CPA: 服务=${formatPushServiceName(service)} 文件=${fileName}`);
+        }
+        if (accountId && service.id) {
+          try {
+            ensureAccountPlatformBinding(accountId, service.id);
+            if (jobId) {
+              addJobEvent(jobId, "info", `已绑定平台: ${formatPushServiceName(service)}`);
+            }
+          } catch (bindErr) {
+            console.warn(`ensureAccountPlatformBinding failed: ${bindErr instanceof Error ? bindErr.message : String(bindErr)}`);
+          }
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -219,6 +256,16 @@ async function pushAuthFileAfterRegistration(authFile: string | undefined, targe
         if (jobId) {
           addJobEvent(jobId, "success", `已上传 Sub2API: 服务=${formatPushServiceName(service)} 文件=${fileName} created=${result.created} updated=${result.updated} skipped=${result.skipped}`);
         }
+        if (accountId && service.id) {
+          try {
+            ensureAccountPlatformBinding(accountId, service.id);
+            if (jobId) {
+              addJobEvent(jobId, "info", `已绑定平台: ${formatPushServiceName(service)}`);
+            }
+          } catch (bindErr) {
+            console.warn(`ensureAccountPlatformBinding failed: ${bindErr instanceof Error ? bindErr.message : String(bindErr)}`);
+          }
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`sub2apiAuthUploadFailed: ${fileName} service=${formatPushServiceName(service)} error=${message}`);
@@ -244,7 +291,7 @@ function resolveRegistrationPassword(input?: string): string {
   return password;
 }
 
-async function runSingleRegistration(options: RegisterOptions, email?: string): Promise<SingleRegistrationResult> {
+async function runSingleRegistration(options: RegisterOptions, email?: string, sharedBroker?: ISMSActivationBroker): Promise<SingleRegistrationResult> {
   throwIfJobCancelled(options.jobId);
   const cancellation = createCancellationSignal(options.jobId);
   const scopedOptions: RegisterOptions = {
@@ -252,16 +299,16 @@ async function runSingleRegistration(options: RegisterOptions, email?: string): 
     shouldCancel: () => Boolean(options.shouldCancel?.() || cancellation.isCancelled()),
   };
   try {
-    return await runSingleRegistrationInner(scopedOptions, email);
+    return await runSingleRegistrationInner(scopedOptions, email, sharedBroker);
   } finally {
     cancellation.dispose();
   }
 }
 
-async function runSingleRegistrationInner(options: RegisterOptions, email?: string): Promise<SingleRegistrationResult> {
+async function runSingleRegistrationInner(options: RegisterOptions, email?: string, sharedBroker?: ISMSActivationBroker): Promise<SingleRegistrationResult> {
   const password = resolveRegistrationPassword(options.password);
   const smsVerificationEnabled = isSmsVerificationEnabled(options);
-  const smsBroker = createBrokerForRegistration(options);
+  const smsBroker = smsVerificationEnabled ? (sharedBroker ?? createBrokerForRegistration(options)) : undefined;
   const deviceProfile = generateRandomDeviceProfile();
   const databaseProvider = options.useMailboxPool && !email
     ? createDatabaseMailboxProvider(options.mailboxSourceId, options.mailboxTypeId)
@@ -339,9 +386,12 @@ async function runSingleRegistrationInner(options: RegisterOptions, email?: stri
       const finalPassword = password;
       console.log(`[授权成功] 邮箱：${client.email} 密码：${finalPassword} 授权文件：${result.authFile ?? ""}`);
       await removeSuccessfulEmail(client.email);
-      await importAuthFileFromResult(result.authFile, finalPassword);
-      await pushAuthFileAfterRegistration(result.authFile, options.uploadTarget, options.jobId);
       const mailbox = consumeReservedMailbox();
+      const imported = await importAuthFileFromResult(result.authFile, finalPassword, {
+        sourceId: mailbox?.source_id ?? null,
+        mailboxId: mailbox?.id ?? null,
+      });
+      await pushAuthFileAfterRegistration(result.authFile, options.uploadTarget, options.jobId, imported?.accountId);
       if (mailbox) {
         markMailboxUsed(mailbox.id, true, "used");
       }
@@ -385,10 +435,13 @@ async function runSingleRegistrationInner(options: RegisterOptions, email?: stri
     throwIfJobCancelled(options.jobId);
     const accessToken = await registerClient.getChatGPTAccessToken();
     const accessTokenFile = await registerClient.saveChatGPTAccessToken(accessToken);
-    await importAuthFileFromResult(accessTokenFile, password);
+    const mailbox = consumeReservedMailbox();
+    await importAuthFileFromResult(accessTokenFile, password, {
+      sourceId: mailbox?.source_id ?? null,
+      mailboxId: mailbox?.id ?? null,
+    });
     console.log(`[注册成功] 邮箱：${registerClient.email} 密码：${password}`);
     console.log(`[access_token_file] ${accessTokenFile}`);
-    const mailbox = consumeReservedMailbox();
     if (mailbox) {
       markMailboxUsed(mailbox.id, true, "used");
     }
@@ -412,9 +465,12 @@ async function runSingleRegistrationInner(options: RegisterOptions, email?: stri
     const finalPassword = password;
     console.log(`[授权成功] 邮箱：${loginClient.email} 密码：${finalPassword} 授权文件：${result.authFile ?? ""}`);
     await removeSuccessfulEmail(loginClient.email);
-    await importAuthFileFromResult(result.authFile, finalPassword);
-    await pushAuthFileAfterRegistration(result.authFile, options.uploadTarget, options.jobId);
     const mailbox = consumeReservedMailbox();
+    const imported = await importAuthFileFromResult(result.authFile, finalPassword, {
+      sourceId: mailbox?.source_id ?? null,
+      mailboxId: mailbox?.id ?? null,
+    });
+    await pushAuthFileAfterRegistration(result.authFile, options.uploadTarget, options.jobId, imported?.accountId);
     if (mailbox) {
       markMailboxUsed(mailbox.id, true, "used");
     }
@@ -476,6 +532,11 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
     console.log(`[失败记录] 已清理 ${errorFile}`);
   }
 
+  const sharedBroker = createBrokerForRegistration(options);
+  if (sharedBroker && options.jobId) {
+    addJobEvent(options.jobId, "info", "已启用 SMS 号码跨轮复用：同一号码会继续 requestAnotherSms 直至达到使用上限");
+  }
+
   let success = 0;
   let failed = 0;
   let smsNumbersUsed = 0;
@@ -483,36 +544,53 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
   const successEmails: string[] = [];
   const failedEmails: string[] = [];
 
-  for (let index = 0; index < maxRounds; index += 1) {
-    throwIfJobCancelled(options.jobId);
-    if (usesHotmailEmailQueue) {
-      const remaining = await getHotmailRemainingEmailCount();
-      if (remaining <= 0) {
-        console.log("邮箱列表已全部使用完毕，自动停止");
-        break;
+  try {
+    for (let index = 0; index < maxRounds; index += 1) {
+      throwIfJobCancelled(options.jobId);
+      if (usesHotmailEmailQueue) {
+        const remaining = await getHotmailRemainingEmailCount();
+        if (remaining <= 0) {
+          console.log("邮箱列表已全部使用完毕，自动停止");
+          break;
+        }
+      }
+
+      const targetEmail = emails[index] ?? "";
+      const modeLabel = usesMailboxPool ? "邮箱池" : (targetEmail ? "指定邮箱" : "自动邮箱");
+      console.log(`第 ${index + 1} 轮开始: 成功=${success} 失败=${failed} 模式=${modeLabel}`);
+      try {
+        const result = await runSingleRegistration(options, targetEmail, sharedBroker);
+        success += 1;
+        smsNumbersUsed += result.smsNumbersUsed;
+        smsSuccessCount += result.smsSuccessCount;
+        successEmails.push(result.email);
+      } catch (error) {
+        rethrowIfCancellation(error, options);
+        failed += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        failedEmails.push(targetEmail || "auto");
+        console.error(`[授权失败] ${targetEmail || "auto"} ${message}`);
+      }
+      console.log(`[任务统计] 总轮数 ${maxRounds}，已完成 ${index + 1}，成功 ${success}，失败 ${failed}，短信号码 ${smsNumbersUsed}，短信成功 ${smsSuccessCount}`);
+      if (index < maxRounds - 1) {
+        await waitBetweenRegistrationRounds(options.jobId, appConfig.loopDelayMs, index + 2);
       }
     }
+  } finally {
+    if (sharedBroker) {
+      try {
+        await releaseSharedBroker(sharedBroker, options.jobId);
+      } catch (error) {
+        console.warn("[SMS 号码释放失败]", error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
 
-    const targetEmail = emails[index] ?? "";
-    const modeLabel = usesMailboxPool ? "邮箱池" : (targetEmail ? "指定邮箱" : "自动邮箱");
-    console.log(`第 ${index + 1} 轮开始: 成功=${success} 失败=${failed} 模式=${modeLabel}`);
-    try {
-      const result = await runSingleRegistration(options, targetEmail);
-      success += 1;
-      smsNumbersUsed += result.smsNumbersUsed;
-      smsSuccessCount += result.smsSuccessCount;
-      successEmails.push(result.email);
-    } catch (error) {
-      rethrowIfCancellation(error, options);
-      failed += 1;
-      const message = error instanceof Error ? error.message : String(error);
-      failedEmails.push(targetEmail || "auto");
-      console.error(`[授权失败] ${targetEmail || "auto"} ${message}`);
-    }
-    console.log(`[任务统计] 总轮数 ${maxRounds}，已完成 ${index + 1}，成功 ${success}，失败 ${failed}，短信号码 ${smsNumbersUsed}，短信成功 ${smsSuccessCount}`);
-    if (index < maxRounds - 1) {
-      await waitBetweenRegistrationRounds(options.jobId, appConfig.loopDelayMs, index + 2);
-    }
+  // 共享 broker 的累计统计覆盖轮次累加值（避免重复计数）
+  if (sharedBroker) {
+    const summary = summarizeSmsBrokerUsage(sharedBroker);
+    smsNumbersUsed = summary.smsNumbersUsed;
+    smsSuccessCount = summary.smsSuccessCount;
   }
 
   const completed = success + failed;
@@ -528,6 +606,18 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
     emails: successEmails,
     failedEmails,
   };
+}
+
+async function releaseSharedBroker(broker: ISMSActivationBroker, jobId?: number): Promise<void> {
+  const reader = broker as ISMSActivationBroker & {debugGetCurrentActivation?: () => unknown};
+  const current = typeof reader.debugGetCurrentActivation === "function" ? reader.debugGetCurrentActivation() : null;
+  if (!current) {
+    return;
+  }
+  if (jobId) {
+    addJobEvent(jobId, "info", "释放最后一个 SMS 号码（延迟取消）");
+  }
+  await broker.discardCurrentActivationAndCancelLater();
 }
 
 export function assertRegistrationSucceeded(result: RegisterResult): RegisterResult {

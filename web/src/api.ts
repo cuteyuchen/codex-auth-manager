@@ -13,7 +13,7 @@ export async function apiSend<T>(url: string, method: "POST" | "PUT" | "DELETE",
     headers: {
       "Content-Type": "application/json",
     },
-    body: method === "DELETE" ? undefined : JSON.stringify(body),
+    body: JSON.stringify(body ?? {}),
   });
   if (!response.ok) {
     handleUnauthorized(response);

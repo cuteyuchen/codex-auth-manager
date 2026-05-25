@@ -408,6 +408,18 @@ function openProfile(row: Account) {
   accountSourceId.value = row.source_id ?? null;
   profileDialog.value = true;
   void loadMailSources();
+  if (row.has_password) {
+    void (async () => {
+      try {
+        const payload = await apiGet<{ hasPassword: boolean; password: string }>(`/api/accounts/${row.id}/password`);
+        if (activeAccount.value?.id === row.id && profileDialog.value) {
+          passwordValue.value = payload.password ?? "";
+        }
+      } catch {
+        // 拉取失败保持空，用户可手动输入
+      }
+    })();
+  }
 }
 
 async function saveProfile() {

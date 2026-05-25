@@ -318,7 +318,13 @@ onMounted(load);
         <el-card shadow="never">
           <template #header>
             <div class="flex items-center justify-between">
-              <span>HeroSMS</span>
+              <div class="flex items-center gap-2">
+                <span>HeroSMS</span>
+                <a href="https://hero-sms.com/?ref=964178" target="_blank" rel="noopener noreferrer"
+                   class="text-lg text-[var(--el-color-primary)] hover:underline font-bold ">
+                  点击注册
+                </a>
+              </div>
               <el-button :icon="Refresh" :loading="loadingHero || loadingHeroPrices" size="small" @click="refreshHeroSms">刷新</el-button>
             </div>
           </template>
@@ -355,30 +361,6 @@ onMounted(load);
               </el-select>
               <div v-if="heroError" class="mt-2 text-sm text-amber-600">{{ heroError }}</div>
             </el-form-item>
-            <el-row :gutter="12">
-              <el-col :xs="24" :sm="12">
-                <el-form-item label="服务代码">
-                  <el-input
-                    v-model="heroService"
-                    placeholder="dr"
-                    clearable
-                    @keyup.enter="loadHeroPrices"
-                  >
-                    <template #append>
-                      <el-button :icon="Refresh" :loading="loadingHeroPrices" @click="loadHeroPrices">价格</el-button>
-                    </template>
-                  </el-input>
-                </el-form-item>
-              </el-col>
-              <el-col :xs="24" :sm="12">
-                <el-form-item label="当前查询">
-                  <div class="flex min-h-8 w-full flex-wrap items-center gap-2 rounded-md border border-[var(--el-border-color)] px-3 py-1.5 text-sm">
-                    <el-tag size="small" effect="plain">{{ selectedHeroCountry?.countryName || selectedHeroCountry?.countryNameEn || config.heroSMSCountry || "未选择国家" }}</el-tag>
-                    <el-tag size="small" type="info" effect="plain">服务 {{ heroService.trim() || "dr" }}</el-tag>
-                  </div>
-                </el-form-item>
-              </el-col>
-            </el-row>
             <el-row :gutter="12">
               <el-col :xs="24" :sm="12">
                 <el-form-item label="最高价格"><el-input-number v-model="config.heroSMSMaxPrice" :step="0.01" :min="0" class="w-full" /></el-form-item>
