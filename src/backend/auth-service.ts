@@ -5,6 +5,7 @@ import {Buffer} from "node:buffer";
 import {fetch as undiciFetch, Agent, ProxyAgent, type Dispatcher, type RequestInit as UndiciRequestInit} from "undici";
 import {appConfig} from "../core/config.js";
 import {AUTH_OAUTH_TOKEN_URLS, DEFAULT_CLIENT_ID, DEFAULT_USER_AGENT} from "../core/constants.js";
+import {normalizeEmailAddress} from "../core/email-normalize.js";
 import type {SavedAuthRecord} from "../core/openai.js";
 import {getDb, currentTimestamp, getAuthFileContent, updateAuthFileContent, type AccountRow, type AuthFileRow} from "./db.js";
 import {decryptSecret, encryptSecret} from "./crypto.js";
@@ -14,6 +15,8 @@ import {
   saveAuthFileJsonObjectToCPAService,
   deleteAuthFileFromCPAService,
   uploadAuthFileToSub2APIService,
+  recoverSub2APIAccountStateService,
+  setSub2APIAccountSchedulableService,
   deleteAccountFromSub2APIService,
 } from "./integration-service.js";
 import {
@@ -345,9 +348,9 @@ function normalizeRefreshedAuthRecord(existing: AuthRecord, payload: OAuthTokenR
         existing.account_id?.trim() ||
         "";
   const email =
-        existing.email?.trim() ||
-        idClaims?.email?.trim() ||
-        accessClaims?.email?.trim() ||
+        normalizeEmailAddress(existing.email) ||
+        normalizeEmailAddress(idClaims?.email) ||
+        normalizeEmailAddress(accessClaims?.email) ||
         "";
   const exp =
         accessClaims?.exp
@@ -465,7 +468,7 @@ async function moveTo401Dir(filePath: string): Promise<boolean> {
 export async function summarizeAuthFile(authFileId: number, contentJson: string, forceRefresh: boolean): Promise<AuthSummary> {
   let record = JSON.parse(contentJson) as AuthRecord;
   const claims = decodeJwtClaims(record.id_token ?? record.access_token);
-  const email = record.email?.trim() || claims?.email?.trim() || `auth-file-${authFileId}`;
+  const email = normalizeEmailAddress(record.email) || normalizeEmailAddress(claims?.email) || `auth-file-${authFileId}`;
   const localPlan = claims?.["https://api.openai.com/auth"]?.chatgpt_plan_type?.trim() || "-";
   const credentialType = resolveCredentialType(record);
 
@@ -624,14 +627,15 @@ export async function importAuthFiles(): Promise<{imported: number; updated: num
       const content = await readFile(filePath, "utf8");
       const record = JSON.parse(content) as AuthRecord;
       const claims = decodeJwtClaims(record.id_token ?? record.access_token);
-      const email = record.email?.trim() || claims?.email?.trim();
+      const email = normalizeEmailAddress(record.email) || normalizeEmailAddress(claims?.email);
       if (!email) {
         skipped += 1;
         continue;
       }
 
       const authExists = getDb().prepare("SELECT id FROM auth_files WHERE file_path = ?").get(filePath);
-      await upsertAccountFromAuthRecord(record, filePath, {contentJson: content});
+      const normalizedRecord = {...record, email};
+      await upsertAccountFromAuthRecord(normalizedRecord, filePath, {contentJson: JSON.stringify(normalizedRecord, null, 2)});
       if (authExists) {
         updated += 1;
       } else {
@@ -651,10 +655,11 @@ export async function upsertAccountFromAuthRecord(
   options: UpsertAuthOptions = {},
 ): Promise<AccountRow> {
   const claims = decodeJwtClaims(record.id_token ?? record.access_token);
-  const email = record.email?.trim() || claims?.email?.trim();
+  const email = normalizeEmailAddress(record.email) || normalizeEmailAddress(claims?.email);
   if (!email) {
     throw new Error("auth 记录缺少 email");
   }
+  const normalizedRecord = {...record, email};
   const timestamp = currentTimestamp();
   const sourceKind = options.sourceKind ?? (filePath && !options.preserveSource ? "local" : undefined);
   const sourceName = options.sourceName ?? null;
@@ -723,7 +728,7 @@ export async function upsertAccountFromAuthRecord(
         credential_type: credentialType,
         status_code: initialStatusCode,
         status_label: initialStatusLabel,
-        last_auth_at: record.last_refresh ?? timestamp,
+        last_auth_at: normalizedRecord.last_refresh ?? timestamp,
         credential_source_kind: sourceKind ?? null,
         credential_source_name: sourceName,
         credential_source_service_id: sourceServiceId,
@@ -752,7 +757,7 @@ export async function upsertAccountFromAuthRecord(
       email,
       provider: appConfig.provider,
       plan,
-      last_auth_at: record.last_refresh ?? timestamp,
+      last_auth_at: normalizedRecord.last_refresh ?? timestamp,
       created_at: timestamp,
       updated_at: timestamp,
       credential_type: credentialType,
@@ -770,16 +775,23 @@ export async function upsertAccountFromAuthRecord(
     ? getDb().prepare("SELECT * FROM accounts WHERE id = ?").get(options.accountId) as AccountRow
     : getDb().prepare("SELECT * FROM accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))").get(email) as AccountRow;
   if (filePath) {
-    upsertAuthFile(account.id, filePath, record, options);
+    upsertAuthFile(account.id, filePath, normalizedRecord, {
+      ...options,
+      contentJson: JSON.stringify(normalizedRecord, null, 2),
+    });
   }
   return account;
 }
 
 export function upsertAuthFile(accountId: number, filePath: string, record: AuthRecord, options: UpsertAuthOptions = {}): AuthFileRow {
   const timestamp = currentTimestamp();
-  const credentialType = resolveCredentialType(record);
+  const normalizedRecord = {
+    ...record,
+    email: normalizeEmailAddress(record.email) || record.email,
+  };
+  const credentialType = resolveCredentialType(normalizedRecord);
   const shouldActivate = options.activate !== false;
-  const contentJson = options.contentJson ?? JSON.stringify(record, null, 2);
+  const contentJson = JSON.stringify(normalizedRecord, null, 2);
   if (shouldActivate) {
     getDb().prepare("UPDATE auth_files SET active = 0 WHERE account_id = ? AND file_path <> ?").run(accountId, filePath);
   }
@@ -818,7 +830,7 @@ export function upsertAuthFile(accountId: number, filePath: string, record: Auth
     file_path: filePath,
     file_name: path.basename(filePath),
     active: shouldActivate ? 1 : 0,
-    token_expires_at: record.expired ?? record.expires_at ?? null,
+    token_expires_at: normalizedRecord.expired ?? normalizedRecord.expires_at ?? null,
     credential_type: credentialType,
     current_step: credentialType === "access_token_only" ? "保存 accessToken" : "导入 auth",
     step_status: "success",
@@ -1284,6 +1296,108 @@ function resolveBindServiceId(kind: "cpa" | "sub2api", serviceId: number | undef
   return null;
 }
 
+function resolveKnownSub2APIRemoteIds(accountId: number, serviceId: number | undefined): number[] {
+  if (!serviceId) {
+    return [];
+  }
+  const rows = getDb().prepare(`
+    SELECT credential_source_remote_id AS remoteId
+    FROM auth_files
+    WHERE account_id = ?
+      AND credential_source_kind = 'sub2api'
+      AND credential_source_service_id = ?
+      AND credential_source_remote_id IS NOT NULL
+    UNION
+    SELECT credential_source_remote_id AS remoteId
+    FROM accounts
+    WHERE id = ?
+      AND credential_source_kind = 'sub2api'
+      AND credential_source_service_id = ?
+      AND credential_source_remote_id IS NOT NULL
+  `).all(accountId, serviceId, accountId, serviceId) as Array<{remoteId: string | null}>;
+  const ids = new Set<number>();
+  for (const row of rows) {
+    const id = Number(String(row.remoteId ?? "").trim());
+    if (Number.isFinite(id) && id > 0) {
+      ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
+function rememberSub2APIRemoteId(accountId: number, authFileId: number, serviceId: number | undefined, remoteId: number | null): void {
+  if (!serviceId || !remoteId) {
+    return;
+  }
+  const timestamp = currentTimestamp();
+  getDb().prepare(`
+    UPDATE auth_files
+    SET credential_source_kind = 'sub2api',
+        credential_source_service_id = @service_id,
+        credential_source_remote_id = @remote_id,
+        credential_synced_at = @synced_at,
+        updated_at = @updated_at
+    WHERE id = @auth_file_id
+  `).run({
+    auth_file_id: authFileId,
+    service_id: serviceId,
+    remote_id: String(remoteId),
+    synced_at: timestamp,
+    updated_at: timestamp,
+  });
+  getDb().prepare(`
+    UPDATE accounts
+    SET credential_source_kind = 'sub2api',
+        credential_source_service_id = @service_id,
+        credential_source_remote_id = @remote_id,
+        credential_synced_at = @synced_at,
+        updated_at = @updated_at
+    WHERE id = @account_id
+  `).run({
+    account_id: accountId,
+    service_id: serviceId,
+    remote_id: String(remoteId),
+    synced_at: timestamp,
+    updated_at: timestamp,
+  });
+}
+
+async function recoverSub2APIAccountStatesAfterPush(
+  accountId: number,
+  service: {id?: number; baseUrl: string; secret: string; options: Record<string, unknown>},
+  accountIds: number[],
+): Promise<{
+  recovered: number[];
+  schedulableEnabled: number[];
+  failed: Array<{accountId: number; error: string}>;
+}> {
+  const ids = [...new Set([
+    ...accountIds,
+    ...resolveKnownSub2APIRemoteIds(accountId, service.id),
+  ])];
+  const recovered: number[] = [];
+  const schedulableEnabled: number[] = [];
+  const failed: Array<{accountId: number; error: string}> = [];
+  const config = {
+    baseUrl: service.baseUrl,
+    adminApiKey: service.secret,
+    options: service.options,
+  };
+  for (const remoteId of ids) {
+    try {
+      await recoverSub2APIAccountStateService(config, remoteId);
+      recovered.push(remoteId);
+      await setSub2APIAccountSchedulableService(config, remoteId, true);
+      schedulableEnabled.push(remoteId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failed.push({accountId: remoteId, error: message});
+      console.warn(`sub2apiRecoverStateOrSchedulableFailed: account=${accountId} remote=${remoteId} error=${message}`);
+    }
+  }
+  return {recovered, schedulableEnabled, failed};
+}
+
 export function readAccountAuthFile(accountId: number): {fileName: string; content: Buffer} {
   const authFile = getActiveAuthFile(accountId);
   const contentJson = authFile.content_json ?? getAuthFileContent(authFile.id);
@@ -1560,12 +1674,29 @@ export async function pushAccount(accountId: number, target: PushTarget, service
           adminApiKey: service.secret,
           options: service.options,
         }, fileName, record);
+        if (uploadResult.accountIds.length) {
+          rememberSub2APIRemoteId(accountId, authFile.id, service.id, uploadResult.accountIds[0] ?? null);
+        }
+        const recovery = await recoverSub2APIAccountStatesAfterPush(accountId, service, uploadResult.accountIds);
         const boundId = resolveBindServiceId("sub2api", service.id, service.baseUrl);
         if (boundId) {
           ensureAccountPlatformBinding(accountId, boundId);
-          updateBindingPushResult(accountId, boundId, "success", "Sub2API 推送成功");
+          const message = recovery.failed.length
+            ? `Sub2API 推送成功；恢复状态/启用调度失败: ${recovery.failed.map((item) => `${item.accountId} ${item.error}`).join("; ")}`
+            : recovery.schedulableEnabled.length
+              ? `Sub2API 推送成功；已恢复状态并启用调度: ${recovery.schedulableEnabled.join(", ")}`
+              : "Sub2API 推送成功；未返回远端 ID，跳过状态恢复和启用调度";
+          updateBindingPushResult(accountId, boundId, recovery.failed.length || !recovery.schedulableEnabled.length ? "failed" : "success", message);
         }
-        serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, ...uploadResult});
+        serviceResults.push({
+          id: service.id,
+          name: service.name,
+          fallback: service.fallback,
+          ...uploadResult,
+          recovered: recovery.recovered,
+          schedulableEnabled: recovery.schedulableEnabled,
+          recoverFailed: recovery.failed,
+        });
       } catch (error) {
         const boundId = resolveBindServiceId("sub2api", service.id, service.baseUrl);
         if (boundId) {

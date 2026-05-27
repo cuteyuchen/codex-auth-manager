@@ -13,6 +13,7 @@ import {appConfig} from "./config.js";
 import {shouldAutoUploadAuthToCLIProxyAPI, uploadAuthFileToCLIProxyAPI} from "./cliproxyapi.js";
 import {shouldAutoUploadAuthToSub2API, uploadAuthFileToSub2API} from "./sub2api.js";
 import {defaultDeviceProfile, type DeviceProfile, getDeviceClientHints} from "./device-profile.js";
+import {normalizeEmailAddress} from "./email-normalize.js";
 import {
   AUTH_AUTHORIZE_CONTINUE_URL,
   AUTH_BASE_URL,
@@ -255,7 +256,7 @@ export class OpenAIClient {
     this.smsVerificationDisabled = Boolean(options.smsVerificationDisabled);
     this.shouldCancel = options.shouldCancel;
     this.abortController = options.shouldCancel ? new AbortController() : undefined;
-    this.email = options.email?.trim() ?? "";
+    this.email = normalizeEmailAddress(options.email);
     this.password = options.password;
     this.deviceProfile = options.deviceProfile
       ? {
@@ -382,7 +383,7 @@ export class OpenAIClient {
     this.logProgress(step++, totalSteps, "初始化注册会话");
     await this.bootChatGPTSession();
     this.logProgress(step++, totalSteps, "生成注册邮箱");
-    this.email = await this.generateRegisterEmail();
+    this.email = normalizeEmailAddress(await this.generateRegisterEmail());
     console.log("registerEmail:", this.email);
     this.logProgress(step++, totalSteps, "打开注册页");
     await this.openSignupPage(this.email);
@@ -442,7 +443,7 @@ export class OpenAIClient {
     if (!this.email) {
       totalSteps += 1;
       this.logProgress(step++, totalSteps, "生成注册邮箱");
-      this.email = await this.generateRegisterEmail();
+      this.email = normalizeEmailAddress(await this.generateRegisterEmail());
       console.log("registerEmail:", this.email);
     }
 
@@ -1172,7 +1173,7 @@ export class OpenAIClient {
 
     const accessClaims = this.decodeJwtPayload<JwtPayload>(payload.access_token);
     const idClaims = this.decodeJwtPayload<JwtPayload>(payload.id_token);
-    const email = idClaims.email ?? accessClaims.email ?? this.email;
+    const email = normalizeEmailAddress(idClaims.email) || normalizeEmailAddress(accessClaims.email) || this.email;
     const accountID =
             accessClaims["https://api.openai.com/auth"]?.chatgpt_account_id ??
             idClaims["https://api.openai.com/auth"]?.chatgpt_account_id ??
@@ -1232,13 +1233,17 @@ export class OpenAIClient {
   private async saveAuthRecord(record: SavedAuthRecord): Promise<string> {
     const authDir = path.resolve(process.cwd(), "auth", COMMAND_AUTH_DIR_NAME);
     await mkdir(authDir, {recursive: true});
-    const fileName = this.buildAuthFileName(record.email);
+    const normalizedRecord = {
+      ...record,
+      email: normalizeEmailAddress(record.email) || record.email,
+    };
+    const fileName = this.buildAuthFileName(normalizedRecord.email);
     const filePath = path.join(authDir, fileName);
-    await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    await writeFile(filePath, `${JSON.stringify(normalizedRecord, null, 2)}\n`, "utf8");
 
     if (shouldAutoUploadAuthToCLIProxyAPI()) {
       try {
-        await uploadAuthFileToCLIProxyAPI(fileName, record);
+        await uploadAuthFileToCLIProxyAPI(fileName, normalizedRecord);
         console.log(`cliproxyApiAuthUploaded: ${fileName}`);
       } catch (error) {
         console.warn(
@@ -1249,7 +1254,7 @@ export class OpenAIClient {
 
     if (shouldAutoUploadAuthToSub2API()) {
       try {
-        const result = await uploadAuthFileToSub2API(fileName, record);
+        const result = await uploadAuthFileToSub2API(fileName, normalizedRecord);
         console.log(
           `sub2apiAuthUploaded: ${fileName} created=${result.created} updated=${result.updated} skipped=${result.skipped}`,
         );

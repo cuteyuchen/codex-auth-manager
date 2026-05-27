@@ -13,6 +13,7 @@ import {
 import {OpenAIClient, type SavedAuthRecord} from "../core/openai.js";
 import {createSMSBroker} from "../core/sms/index.js";
 import type {ISMSActivationBroker} from "../core/sms/activation-broker.js";
+import {normalizeEmailAddress} from "../core/email-normalize.js";
 import {getAccount, getAccountPassword, setAccountPassword, upsertAccountFromAuthRecord, loadAuthRecord, updateAuthFileStep} from "./auth-service.js";
 import {
   JobCancelledError,
@@ -342,13 +343,14 @@ async function runSingleRegistrationInner(options: RegisterOptions, email?: stri
       : undefined;
   const emailAddressProvider = databaseProvider
     ? async () => {
-      return databaseProvider.getEmailAddress();
+      return normalizeEmailAddress(await databaseProvider.getEmailAddress());
     }
     : undefined;
   if (emailAddressProvider && !email) {
     throwIfJobCancelled(options.jobId);
     email = await emailAddressProvider();
   }
+  email = normalizeEmailAddress(email);
   if (options.authOnly) {
     throwIfJobCancelled(options.jobId);
     if (!email) {
@@ -527,7 +529,7 @@ async function runRegistrationJobInner(options: RegisterOptions): Promise<Regist
   const emails = [
     ...(options.emails ?? []),
     ...(options.email ? [options.email] : []),
-  ].map((item) => item.trim()).filter(Boolean);
+  ].map((item) => normalizeEmailAddress(item)).filter(Boolean);
   const maxRounds = options.rounds && options.rounds > 0 ? options.rounds : (emails.length || 1);
   const usesMailboxPool = Boolean(options.useMailboxPool && emails.length === 0);
   const usesHotmailEmailQueue = appConfig.provider === "hotmail" && emails.length === 0 && !usesMailboxPool;

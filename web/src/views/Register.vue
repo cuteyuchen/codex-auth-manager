@@ -52,7 +52,13 @@ const hotmailModes = [
   {label: "熊猫电竞", value: "xiongmaodian"},
 ];
 
-const emails = computed(() => form.emailText.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean));
+function normalizeEmail(value: string) {
+  const input = String(value ?? "").trim();
+  const match = input.match(/<([^>]+)>/);
+  return (match?.[1] ?? input).trim().toLowerCase();
+}
+
+const emails = computed(() => form.emailText.split(/\r?\n|,/).map(normalizeEmail).filter(Boolean));
 const filteredSources = computed(() => sources.value.filter((item) => item.enabled));
 const selectedSource = computed(() => sources.value.find((item) => String(item.id) === form.mailboxSourceId));
 const activeJob = computed(() => currentJob.value ? ["queued", "running", "waiting_input"].includes(currentJob.value.status) : false);

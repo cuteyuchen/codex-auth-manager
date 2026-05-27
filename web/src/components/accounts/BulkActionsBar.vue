@@ -6,7 +6,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: "check"): void;
-  (event: "repair"): void;
   (event: "refresh"): void;
   (event: "reauth"): void;
   (event: "push"): void;
@@ -19,7 +18,6 @@ const emit = defineEmits<{
 <template>
   <div class="flex flex-wrap gap-1.5">
     <el-button :loading="loading" @click="emit('check')">批量检查</el-button>
-    <el-button :loading="loading" type="success" plain @click="emit('repair')">批量修复</el-button>
     <el-button :loading="loading" @click="emit('refresh')">批量刷新</el-button>
     <el-button :loading="loading" @click="emit('reauth')">批量自动重登</el-button>
     <el-button :loading="loading" @click="emit('push')">批量推送</el-button>

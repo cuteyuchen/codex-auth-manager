@@ -1,6 +1,7 @@
 import {copyFileSync, existsSync, mkdirSync, readFileSync, statSync} from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import {normalizeEmailAddress} from "../core/email-normalize.js";
 
 export const DATA_DIR = path.resolve(process.cwd(), "data");
 const LEGACY_DB_BASENAME = `${["codex", "register"].join("-")}.db`;
@@ -447,8 +448,9 @@ function migrate(database: Database.Database): void {
         CREATE INDEX IF NOT EXISTS idx_credential_sync_events_service ON credential_sync_events(integration_service_id, id);
     `);
 
-  backfillPlatformBindings(database);
   migrateAuthFileContentToDb(database);
+  migrateLowercaseEmails(database);
+  backfillPlatformBindings(database);
 
   addColumnIfMissing(database, "mail_sources", "mail_type_id", "INTEGER REFERENCES mail_types(id) ON DELETE SET NULL");
   addColumnIfMissing(database, "mail_sources", "vendor", "TEXT");
@@ -544,6 +546,170 @@ function addColumnIfMissing(database: Database.Database, table: string, column: 
     return;
   }
   database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function migrateLowercaseEmails(database: Database.Database): void {
+  const timestamp = now();
+  const mergeAccount = database.transaction((targetId: number, duplicateId: number) => {
+    const duplicate = database.prepare(`
+      SELECT password_encrypted, source_id, mailbox_id,
+             credential_source_kind, credential_source_name, credential_source_service_id,
+             credential_source_remote_id, credential_synced_at
+      FROM accounts
+      WHERE id = ?
+    `).get(duplicateId) as {
+      password_encrypted: string | null;
+      source_id: number | null;
+      mailbox_id: number | null;
+      credential_source_kind: string | null;
+      credential_source_name: string | null;
+      credential_source_service_id: number | null;
+      credential_source_remote_id: string | null;
+      credential_synced_at: string | null;
+    } | undefined;
+    if (!duplicate) {
+      return;
+    }
+    database.prepare(`
+      UPDATE accounts
+      SET password_encrypted = COALESCE(password_encrypted, @password_encrypted),
+          source_id = COALESCE(source_id, @source_id),
+          mailbox_id = COALESCE(mailbox_id, @mailbox_id),
+          credential_source_kind = COALESCE(credential_source_kind, @credential_source_kind),
+          credential_source_name = COALESCE(credential_source_name, @credential_source_name),
+          credential_source_service_id = COALESCE(credential_source_service_id, @credential_source_service_id),
+          credential_source_remote_id = COALESCE(credential_source_remote_id, @credential_source_remote_id),
+          credential_synced_at = COALESCE(credential_synced_at, @credential_synced_at),
+          updated_at = @updated_at
+      WHERE id = @target_id
+    `).run({...duplicate, target_id: targetId, updated_at: timestamp});
+    database.prepare("UPDATE auth_files SET account_id = ?, updated_at = ? WHERE account_id = ?").run(targetId, timestamp, duplicateId);
+    database.prepare(`
+      DELETE FROM account_usage_windows
+      WHERE account_id = @duplicate_id
+        AND EXISTS (
+          SELECT 1 FROM account_usage_windows target
+          WHERE target.account_id = @target_id
+            AND target.window_key = account_usage_windows.window_key
+        )
+    `).run({target_id: targetId, duplicate_id: duplicateId});
+    database.prepare("UPDATE account_usage_windows SET account_id = ?, updated_at = ? WHERE account_id = ?").run(targetId, timestamp, duplicateId);
+    database.prepare(`
+      DELETE FROM account_platform_bindings
+      WHERE account_id = @duplicate_id
+        AND EXISTS (
+          SELECT 1 FROM account_platform_bindings target
+          WHERE target.account_id = @target_id
+            AND target.integration_service_id = account_platform_bindings.integration_service_id
+        )
+    `).run({target_id: targetId, duplicate_id: duplicateId});
+    database.prepare("UPDATE account_platform_bindings SET account_id = ?, updated_at = ? WHERE account_id = ?").run(targetId, timestamp, duplicateId);
+    database.prepare("UPDATE credential_sync_events SET account_id = ? WHERE account_id = ?").run(targetId, duplicateId);
+    database.prepare("DELETE FROM accounts WHERE id = ?").run(duplicateId);
+  });
+  const duplicateAccounts = database.prepare(`
+    SELECT LOWER(TRIM(email)) AS email
+    FROM accounts
+    GROUP BY LOWER(TRIM(email))
+    HAVING COUNT(*) > 1
+  `).all() as Array<{email: string}>;
+  for (const duplicate of duplicateAccounts) {
+    const rows = database.prepare(`
+      SELECT id, email
+      FROM accounts
+      WHERE LOWER(TRIM(email)) = ?
+      ORDER BY CASE WHEN email = ? THEN 0 ELSE 1 END, id ASC
+    `).all(duplicate.email, duplicate.email) as Array<{id: number; email: string}>;
+    const target = rows[0];
+    if (!target) {
+      continue;
+    }
+    for (const row of rows.slice(1)) {
+      mergeAccount(target.id, row.id);
+    }
+  }
+
+  const mergeMailbox = database.transaction((targetId: number, duplicateId: number) => {
+    const duplicate = database.prepare(`
+      SELECT password_encrypted, client_id_encrypted, refresh_token_encrypted,
+             access_token_encrypted, last_code_status, last_code_at, last_used_at, last_error
+      FROM mailboxes
+      WHERE id = ?
+    `).get(duplicateId) as {
+      password_encrypted: string | null;
+      client_id_encrypted: string | null;
+      refresh_token_encrypted: string | null;
+      access_token_encrypted: string | null;
+      last_code_status: string | null;
+      last_code_at: string | null;
+      last_used_at: string | null;
+      last_error: string | null;
+    } | undefined;
+    if (!duplicate) {
+      return;
+    }
+    database.prepare(`
+      UPDATE mailboxes
+      SET password_encrypted = COALESCE(password_encrypted, @password_encrypted),
+          client_id_encrypted = COALESCE(client_id_encrypted, @client_id_encrypted),
+          refresh_token_encrypted = COALESCE(refresh_token_encrypted, @refresh_token_encrypted),
+          access_token_encrypted = COALESCE(access_token_encrypted, @access_token_encrypted),
+          last_code_status = COALESCE(last_code_status, @last_code_status),
+          last_code_at = COALESCE(last_code_at, @last_code_at),
+          last_used_at = COALESCE(last_used_at, @last_used_at),
+          last_error = COALESCE(last_error, @last_error),
+          used = MAX(used, (SELECT used FROM mailboxes WHERE id = @duplicate_id)),
+          updated_at = @updated_at
+      WHERE id = @target_id
+    `).run({...duplicate, target_id: targetId, duplicate_id: duplicateId, updated_at: timestamp});
+    database.prepare("UPDATE accounts SET mailbox_id = ?, updated_at = ? WHERE mailbox_id = ?").run(targetId, timestamp, duplicateId);
+    database.prepare("UPDATE mail_events SET mailbox_id = ? WHERE mailbox_id = ?").run(targetId, duplicateId);
+    database.prepare("DELETE FROM mailboxes WHERE id = ?").run(duplicateId);
+  });
+  const duplicateMailboxes = database.prepare(`
+    SELECT source_id, LOWER(TRIM(email)) AS email
+    FROM mailboxes
+    GROUP BY source_id, LOWER(TRIM(email))
+    HAVING COUNT(*) > 1
+  `).all() as Array<{source_id: number; email: string}>;
+  for (const duplicate of duplicateMailboxes) {
+    const rows = database.prepare(`
+      SELECT id, email
+      FROM mailboxes
+      WHERE source_id = ? AND LOWER(TRIM(email)) = ?
+      ORDER BY CASE WHEN email = ? THEN 0 ELSE 1 END, id ASC
+    `).all(duplicate.source_id, duplicate.email, duplicate.email) as Array<{id: number; email: string}>;
+    const target = rows[0];
+    if (!target) {
+      continue;
+    }
+    for (const row of rows.slice(1)) {
+      mergeMailbox(target.id, row.id);
+    }
+  }
+
+  database.prepare("UPDATE accounts SET email = LOWER(TRIM(email)), updated_at = ? WHERE email <> LOWER(TRIM(email))").run(timestamp);
+  database.prepare("UPDATE mailboxes SET email = LOWER(TRIM(email)), updated_at = ? WHERE email <> LOWER(TRIM(email))").run(timestamp);
+
+  const authFiles = database.prepare("SELECT id, content_json FROM auth_files WHERE content_json IS NOT NULL AND content_json <> ''").all() as Array<{id: number; content_json: string}>;
+  const updateAuthFile = database.prepare("UPDATE auth_files SET content_json = ?, updated_at = ? WHERE id = ?");
+  for (const row of authFiles) {
+    try {
+      const record = JSON.parse(row.content_json) as {email?: unknown};
+      const email = normalizeEmailAddress(record.email);
+      if (!email || record.email === email) {
+        continue;
+      }
+      updateAuthFile.run(JSON.stringify({...record, email}, null, 2), timestamp, row.id);
+    } catch {
+      // skip invalid auth content
+    }
+  }
+
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email_lower ON accounts(LOWER(TRIM(email)));
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_mailboxes_source_email_lower ON mailboxes(source_id, LOWER(TRIM(email)));
+  `);
 }
 
 function backfillPlatformBindings(database: Database.Database): void {

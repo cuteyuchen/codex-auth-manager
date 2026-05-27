@@ -95,6 +95,27 @@ const mailboxFieldSchema = computed(() => fieldsForProvider(selectedMailboxProvi
 const importPlaceholder = computed(() => placeholderForType(selectedImportType.value));
 const latestEmailDocument = computed(() => buildEmailDocument(latestEmail.value));
 
+function normalizeEmail(value: string) {
+  const input = String(value ?? "").trim();
+  const match = input.match(/<([^>]+)>/);
+  return (match?.[1] ?? input).trim().toLowerCase();
+}
+
+function normalizeMailboxImportText(value: string) {
+  return String(value ?? "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const raw = line.trim();
+      if (!raw || raw.startsWith("#")) {
+        return line;
+      }
+      const parts = raw.split("----");
+      parts[0] = normalizeEmail(parts[0]);
+      return parts.join("----");
+    })
+    .join("\n");
+}
+
 function buildQuery() {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
@@ -295,6 +316,7 @@ async function saveMailbox() {
   try {
     const payload = {
       ...mailboxForm,
+      email: normalizeEmail(mailboxForm.email),
       used: mailboxForm.status === "used",
     };
     if (editingMailboxId.value) {
@@ -354,7 +376,10 @@ function closeImport() {
 async function importMailboxes() {
   importing.value = true;
   try {
-    const result = await apiSend<{imported: number; updated: number; skipped: number}>("/api/mailboxes/import", "POST", importForm);
+    const result = await apiSend<{imported: number; updated: number; skipped: number}>("/api/mailboxes/import", "POST", {
+      ...importForm,
+      text: normalizeMailboxImportText(importForm.text),
+    });
     ElMessage.success(`导入 ${result.imported}，更新 ${result.updated}，跳过 ${result.skipped}`);
     closeImport();
     await load();

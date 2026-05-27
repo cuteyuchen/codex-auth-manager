@@ -1,4 +1,5 @@
 import {Buffer} from "node:buffer";
+import {normalizeEmailAddress} from "../core/email-normalize.js";
 import type {SavedAuthRecord} from "../core/openai.js";
 import type {IntegrationServiceKind} from "./db.js";
 
@@ -83,8 +84,9 @@ function buildFileName(value: unknown, fallback: string): string {
 
 function normalizeAuthRecord(payload: Record<string, unknown>, fallbackEmail?: string): SavedAuthRecord | null {
   const record = {...payload} as unknown as SavedAuthRecord;
-  if (fallbackEmail && !record.email) {
-    record.email = fallbackEmail;
+  const email = normalizeEmailAddress(record.email) || normalizeEmailAddress(fallbackEmail);
+  if (email) {
+    record.email = email;
   }
   if (!record.access_token && !record.refresh_token && !record.id_token) {
     return null;
@@ -110,7 +112,7 @@ function extractEmailFromJwt(token: unknown): string {
     const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
     const claims = JSON.parse(Buffer.from(padded, "base64").toString("utf8")) as {email?: unknown};
-    const email = stringValue(claims.email);
+    const email = normalizeEmailAddress(claims.email);
     return isLikelyEmail(email) ? email : "";
   } catch {
     return "";
@@ -119,7 +121,7 @@ function extractEmailFromJwt(token: unknown): string {
 
 function firstEmail(...values: unknown[]): string | undefined {
   for (const value of values) {
-    const email = stringValue(value);
+    const email = normalizeEmailAddress(value);
     if (isLikelyEmail(email)) {
       return email;
     }

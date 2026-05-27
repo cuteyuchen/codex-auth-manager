@@ -1,4 +1,5 @@
 import type {SavedAuthRecord} from "../core/openai.js";
+import {normalizeEmailAddress} from "../core/email-normalize.js";
 import {getDb, currentTimestamp, type IntegrationServiceKind} from "./db.js";
 import {resolvePushServices} from "./integration-service.js";
 import {fetchCredentialsFromPlatform, type PlatformCredential, type PlatformCredentialFailure, type PlatformServiceConfig} from "./platform-adapters.js";
@@ -37,6 +38,10 @@ function ensureSystemMailSource(): number {
  * 如果邮箱已存在 mailbox 则复用
  */
 async function ensureMailboxForAccount(accountId: number, email: string): Promise<void> {
+  const normalizedEmail = normalizeEmailAddress(email);
+  if (!normalizedEmail) {
+    return;
+  }
   const account = getDb().prepare("SELECT mailbox_id FROM accounts WHERE id = ?").get(accountId) as {mailbox_id: number | null} | undefined;
   if (account?.mailbox_id) {
     return; // 已有绑定，不覆盖
@@ -46,7 +51,7 @@ async function ensureMailboxForAccount(accountId: number, email: string): Promis
   // 检查是否已有该邮箱的 mailbox
   const existing = getDb().prepare(
     "SELECT id FROM mailboxes WHERE source_id = ? AND email = ?",
-  ).get(sourceId, email) as {id: number} | undefined;
+  ).get(sourceId, normalizedEmail) as {id: number} | undefined;
   let mailboxId: number;
   if (existing) {
     mailboxId = existing.id;
@@ -54,7 +59,7 @@ async function ensureMailboxForAccount(accountId: number, email: string): Promis
     const result = getDb().prepare(`
       INSERT INTO mailboxes (source_id, mail_type_id, email, provider, status, used, created_at, updated_at)
       VALUES (?, NULL, ?, 'gptmail', 'unused', 0, ?, ?)
-    `).run(sourceId, email, timestamp, timestamp);
+    `).run(sourceId, normalizedEmail, timestamp, timestamp);
     mailboxId = Number(result.lastInsertRowid);
   }
   // 绑定 account.mailbox_id
@@ -170,7 +175,7 @@ function recordCredentialFailure(service: PlatformServiceConfig, failure: Platfo
 
 function resolveRecordEmail(record: SavedAuthRecord): string {
   const claims = decodeJwtClaims(record.id_token ?? record.access_token);
-  return String(record.email ?? claims?.email ?? "").trim();
+  return normalizeEmailAddress(record.email) || normalizeEmailAddress(claims?.email);
 }
 
 function ensureRecordHasEmail(record: SavedAuthRecord): boolean {
@@ -220,7 +225,7 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
   const filePath = existingPlatformAuth?.filePath ?? buildPlatformFilePath(credential);
   const contentJson = JSON.stringify(credential.record, null, 2);
   if (targetAccountId) {
-    const localEmail = getAccountEmail(targetAccountId);
+    const localEmail = normalizeEmailAddress(getAccountEmail(targetAccountId));
     const record = localEmail ? {...credential.record, email: localEmail} : credential.record;
     const finalContentJson = localEmail ? JSON.stringify(record, null, 2) : contentJson;
     upsertAuthFile(targetAccountId, filePath, record, {
@@ -243,7 +248,9 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
     resolveActivePlatformCredential(targetAccountId);
     return {accountId: targetAccountId, action: "updated"};
   }
-  const account = await upsertAccountFromAuthRecord(credential.record, filePath, {
+  const recordEmail = resolveRecordEmail(credential.record);
+  const record = {...credential.record, email: recordEmail};
+  const account = await upsertAccountFromAuthRecord(record, filePath, {
     sourceKind: credential.service.kind,
     sourceName: credential.service.name,
     sourceServiceId: credential.service.id ?? null,
@@ -251,7 +258,7 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
     syncedAt: currentTimestamp(),
     preserveAccountMetadata: true,
     activate: false,
-    contentJson,
+    contentJson: JSON.stringify(record, null, 2),
   });
   if (credential.service.id) {
     ensureAccountPlatformBinding(account.id, credential.service.id);

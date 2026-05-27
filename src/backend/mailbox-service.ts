@@ -4,7 +4,7 @@ import {createGmailProvider} from "../core/mail/gmail.js";
 import {createGPTMailProvider} from "../core/mail/gptmail.js";
 import {buildHotmailTokenAccount, createHotmailDatabaseProvider, createHotmailProvider} from "../core/mail/hotmail.js";
 import {createProxiedMailProvider} from "../core/mail/proxiedmail.js";
-import {normalizeMailbox} from "../core/mail/verification-matcher.js";
+import {findLatestVerificationMail, normalizeMailbox} from "../core/mail/verification-matcher.js";
 import type {MailProviderName, HotmailMode} from "../core/config.js";
 import type {EmailCodeProvider, EmailVerificationCodeOptions, LatestEmail} from "../core/mailbox.js";
 import {currentTimestamp, getDb, type MailboxRow, type MailSourceRow, type MailTypeRow} from "./db.js";
@@ -1051,6 +1051,9 @@ export async function fetchLatestMailboxEmail(id: number): Promise<MailboxLatest
   }
   try {
     const email = await provider.getLatestEmail(mailbox.email);
+    const emailWithCode = email && !email.verificationCode
+      ? findLatestVerificationMail([email], {targetEmail: mailbox.email, rememberLastCode: false}) ?? email
+      : email;
     getDb().prepare(`
             UPDATE mailboxes
             SET last_code_status = @status,
@@ -1064,8 +1067,8 @@ export async function fetchLatestMailboxEmail(id: number): Promise<MailboxLatest
       last_code_at: currentTimestamp(),
       updated_at: currentTimestamp(),
     });
-    recordMailEvent(source.id, mailbox.id, "mail_fetch", email ? "读取最新邮件成功" : "未找到邮件");
-    return {ok: true, email};
+    recordMailEvent(source.id, mailbox.id, "mail_fetch", emailWithCode ? "读取最新邮件成功" : "未找到邮件");
+    return {ok: true, email: emailWithCode};
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     getDb().prepare(`

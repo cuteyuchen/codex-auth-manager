@@ -1,9 +1,13 @@
+import {normalizeEmailAddress} from "../email-normalize.js";
+
 export interface VerificationMailCandidate {
     id?: string;
     sender?: string;
     recipient?: string | string[];
     subject?: string;
     content?: string;
+    html?: string;
+    snippet?: string;
     timestamp?: number;
     extraTexts?: string[];
 }
@@ -18,9 +22,7 @@ interface FindVerificationMailOptions<T> {
 const lastVerificationCodeByEmail = new Map<string, string>();
 
 export function normalizeMailbox(value: string): string {
-  const input = String(value ?? "").trim().toLowerCase();
-  const angleMatch = input.match(/<([^>]+)>/);
-  return (angleMatch?.[1] ?? input).trim();
+  return normalizeEmailAddress(value);
 }
 
 function normalizeTextForCodeMatching(text: string): string {
@@ -124,7 +126,13 @@ function mailboxMatchesTarget(candidate: string, target: string): boolean {
 }
 
 function collectCandidateTexts(mail: VerificationMailCandidate): string[] {
-  const texts = [mail.subject ?? "", mail.content ?? "", ...(mail.extraTexts ?? [])];
+  const texts = [
+    mail.subject ?? "",
+    mail.content ?? "",
+    mail.html ?? "",
+    mail.snippet ?? "",
+    ...(mail.extraTexts ?? []),
+  ];
   return texts
     .map((item) => String(item ?? "").trim())
     .filter(Boolean);
