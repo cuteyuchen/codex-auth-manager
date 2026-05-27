@@ -973,6 +973,58 @@ export function createDatabaseMailboxProvider(sourceId?: number, typeId?: number
   };
 }
 
+/**
+ * 按 mailbox_id 创建取码 provider
+ * 用于自动重登等场景，直接使用账号绑定的具体邮箱
+ */
+export function createMailboxProviderById(mailboxId: number): EmailCodeProvider {
+  return {
+    async getEmailAddress(): Promise<string> {
+      const mailbox = ensureMailbox(mailboxId);
+      return mailbox.email;
+    },
+    async getEmailVerificationCode(email: string, options?: EmailVerificationCodeOptions): Promise<string> {
+      const mailbox = ensureMailbox(mailboxId);
+      const source = ensureSource(mailbox.source_id);
+      const type = mailbox.mail_type_id ? ensureMailType(mailbox.mail_type_id) : source.mail_type_id ? ensureMailType(source.mail_type_id) : ensureMailTypeByProvider(normalizeProvider(source.provider));
+      if (!source.supports_auto_code || !type.supports_auto_code) {
+        throw new Error(`邮箱 ${mailbox.email} 的来源 ${source.name} 未启用自动取件`);
+      }
+      const provider = await createMailboxProvider(type, mailbox);
+      try {
+        const code = await provider.getEmailVerificationCode(mailbox.email, options);
+        getDb().prepare(`
+          UPDATE mailboxes
+          SET last_code_status = 'success',
+              last_code_at = @last_code_at,
+              last_error = NULL,
+              updated_at = @updated_at
+          WHERE id = @id
+        `).run({id: mailboxId, last_code_at: currentTimestamp(), updated_at: currentTimestamp()});
+        recordMailEvent(source.id, mailboxId, "code_success", `获取验证码成功 ${tail(code)}`);
+        return code;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        getDb().prepare(`
+          UPDATE mailboxes
+          SET last_code_status = 'failed',
+              last_code_at = @last_code_at,
+              last_error = @last_error,
+              updated_at = @updated_at
+          WHERE id = @id
+        `).run({
+          id: mailboxId,
+          last_code_at: currentTimestamp(),
+          last_error: message,
+          updated_at: currentTimestamp(),
+        });
+        recordMailEvent(source.id, mailboxId, "code_failed", message);
+        throw error;
+      }
+    },
+  };
+}
+
 export async function testMailboxCode(id: number): Promise<{ok: boolean; codeTail?: string; error?: string}> {
   const mailbox = ensureMailbox(id);
   try {

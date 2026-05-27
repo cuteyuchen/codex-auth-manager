@@ -100,6 +100,7 @@ export interface AuthSummary {
 export type CredentialSourceKind = "local" | "cpa" | "sub2api";
 
 export interface UpsertAuthOptions {
+    accountId?: number;
     sourceKind?: CredentialSourceKind;
     sourceName?: string | null;
     sourceServiceId?: number | null;
@@ -660,7 +661,12 @@ export async function upsertAccountFromAuthRecord(
   const sourceServiceId = options.sourceServiceId ?? null;
   const sourceRemoteId = options.sourceRemoteId ?? null;
   const syncedAt = options.syncedAt ?? timestamp;
-  const existing = getDb().prepare("SELECT * FROM accounts WHERE email = ?").get(email) as AccountRow | undefined;
+  const existing = options.accountId
+    ? getDb().prepare("SELECT * FROM accounts WHERE id = ?").get(options.accountId) as AccountRow | undefined
+    : getDb().prepare("SELECT * FROM accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))").get(email) as AccountRow | undefined;
+  if (options.accountId && !existing) {
+    throw new Error(`账号不存在: ${options.accountId}`);
+  }
   const plan = claims?.["https://api.openai.com/auth"]?.chatgpt_plan_type?.trim() || existing?.plan || null;
   const credentialType = resolveCredentialType(record);
   const initialStatusCode = credentialType === "access_token_only" ? "access_token_only" : "unchecked";
@@ -760,7 +766,9 @@ export async function upsertAccountFromAuthRecord(
     });
   }
 
-  const account = getDb().prepare("SELECT * FROM accounts WHERE email = ?").get(email) as AccountRow;
+  const account = options.accountId
+    ? getDb().prepare("SELECT * FROM accounts WHERE id = ?").get(options.accountId) as AccountRow
+    : getDb().prepare("SELECT * FROM accounts WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))").get(email) as AccountRow;
   if (filePath) {
     upsertAuthFile(account.id, filePath, record, options);
   }
@@ -1169,7 +1177,19 @@ function updateAccountFromSummary(accountId: number, summary: AuthSummary): void
   updateAuthFileStep(accountId, summary.ok ? "检查完成" : summary.statusLabel, summary.ok ? "success" : "failed");
 }
 
-export async function checkAccount(accountId: number, forceRefresh = false): Promise<AuthSummary> {
+export interface CheckAccountOptions {
+    forceRefresh?: boolean;
+    /** 是否允许自动重登，默认 false（只读检查） */
+    triggerAutoReauth?: boolean;
+}
+
+export async function checkAccount(accountId: number, forceRefreshOrOptions: boolean | CheckAccountOptions = false): Promise<AuthSummary> {
+  const options: CheckAccountOptions = typeof forceRefreshOrOptions === "boolean"
+    ? {forceRefresh: forceRefreshOrOptions}
+    : forceRefreshOrOptions;
+  const forceRefresh = Boolean(options.forceRefresh);
+  const triggerAutoReauth = Boolean(options.triggerAutoReauth);
+
   const authFile = getActiveAuthFile(accountId);
   const contentJson = authFile.content_json ?? getAuthFileContent(authFile.id);
   if (!contentJson) {
@@ -1178,7 +1198,9 @@ export async function checkAccount(accountId: number, forceRefresh = false): Pro
   updateAuthFileStep(accountId, forceRefresh ? "refresh token 刷新中" : "usage 检查中", "running");
   const summary = await summarizeAuthFile(authFile.id, contentJson, forceRefresh);
   updateAccountFromSummary(accountId, summary);
-  maybeTriggerAutoReauth(accountId, summary);
+  if (triggerAutoReauth) {
+    maybeTriggerAutoReauth(accountId, summary);
+  }
   return summary;
 }
 
@@ -1278,21 +1300,40 @@ export interface DeleteAccountOptions {
     deleteFromServiceIds?: number[];
 }
 
+type PlatformDeleteNotice = {serviceId: number; serviceName: string; kind: string; message: string};
+
 export interface DeleteAccountResult {
     deleted: boolean;
     email: string;
-    platformErrors: Array<{serviceId: number; serviceName: string; kind: string; message: string}>;
+    platformErrors: PlatformDeleteNotice[];
     platformDeleted: Array<{serviceId: number; serviceName: string; kind: string}>;
+    platformSkipped: PlatformDeleteNotice[];
+}
+
+function isRemoteMissingDeleteError(kind: string, message: string): boolean {
+  const normalized = message.toLowerCase();
+  if (kind === "cpa") {
+    return message.includes("404") || normalized.includes("auth file not found");
+  }
+  if (kind === "sub2api") {
+    return message.includes("404") || normalized.includes("not found");
+  }
+  return false;
 }
 
 async function deletePlatformRecordsForAccount(
   accountId: number,
   serviceIds: number[],
-): Promise<{deleted: DeleteAccountResult["platformDeleted"]; errors: DeleteAccountResult["platformErrors"]}> {
+): Promise<{
+  deleted: DeleteAccountResult["platformDeleted"];
+  errors: DeleteAccountResult["platformErrors"];
+  skipped: DeleteAccountResult["platformSkipped"];
+}> {
   const deleted: DeleteAccountResult["platformDeleted"] = [];
   const errors: DeleteAccountResult["platformErrors"] = [];
+  const skipped: DeleteAccountResult["platformSkipped"] = [];
   if (!serviceIds.length) {
-    return {deleted, errors};
+    return {deleted, errors, skipped};
   }
   const placeholders = serviceIds.map((_, index) => `@id${index}`).join(",");
   const params: Record<string, number> = {};
@@ -1325,7 +1366,13 @@ async function deletePlatformRecordsForAccount(
       } else if (row.kind === "sub2api") {
         const remote = (row.remoteId ?? "").trim();
         if (!remote) {
-          throw new Error("Sub2API 缺少 remoteId，无法精准删除");
+          skipped.push({
+            serviceId: row.serviceId,
+            serviceName: row.serviceName,
+            kind: row.kind,
+            message: "本地未记录该平台上的远端 ID，已跳过远端删除",
+          });
+          continue;
         }
         await deleteAccountFromSub2APIService({baseUrl: service.baseUrl, adminApiKey: service.secret, options: service.options}, remote);
       } else {
@@ -1333,12 +1380,20 @@ async function deletePlatformRecordsForAccount(
       }
       deleted.push({serviceId: row.serviceId, serviceName: row.serviceName, kind: row.kind});
     } catch (error) {
-      errors.push({
+      const message = error instanceof Error ? error.message : String(error);
+      const notice = {
         serviceId: row.serviceId,
         serviceName: row.serviceName,
         kind: row.kind,
-        message: error instanceof Error ? error.message : String(error),
-      });
+        message: isRemoteMissingDeleteError(row.kind, message)
+          ? "远端记录已不存在，已跳过远端删除"
+          : message,
+      };
+      if (isRemoteMissingDeleteError(row.kind, message)) {
+        skipped.push(notice);
+      } else {
+        errors.push(notice);
+      }
     }
   }
   for (const id of requested) {
@@ -1346,25 +1401,26 @@ async function deletePlatformRecordsForAccount(
       continue;
     }
     const service = getDb().prepare("SELECT kind, name FROM integration_services WHERE id = ?").get(id) as {kind: string; name: string} | undefined;
-    errors.push({
+    skipped.push({
       serviceId: id,
       serviceName: service?.name ?? String(id),
       kind: service?.kind ?? "",
-      message: "本地未记录该平台上的远端 ID，无法删除",
+      message: "本地未记录该平台上的远端 ID，已跳过远端删除",
     });
   }
-  return {deleted, errors};
+  return {deleted, errors, skipped};
 }
 
 export async function deleteAccount(accountId: number, options: DeleteAccountOptions = {}): Promise<DeleteAccountResult> {
   const account = getAccount(accountId);
   const serviceIds = [...new Set((options.deleteFromServiceIds ?? []).map(Number).filter((v) => Number.isFinite(v) && v > 0))];
-  const {deleted, errors} = await deletePlatformRecordsForAccount(accountId, serviceIds);
+  const {deleted, errors, skipped} = await deletePlatformRecordsForAccount(accountId, serviceIds);
   getDb().prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
   return {
     deleted: true,
     email: account.email,
     platformDeleted: deleted,
+    platformSkipped: skipped,
     platformErrors: errors,
   };
 }
@@ -1372,16 +1428,39 @@ export async function deleteAccount(accountId: number, options: DeleteAccountOpt
 export async function bulkDeleteAccounts(
   ids: number[],
   options: DeleteAccountOptions = {},
-): Promise<{total: number; deleted: number; failures: Array<{id: number; message: string}>; perAccount: Array<{id: number; email: string; platformErrors: DeleteAccountResult["platformErrors"]; platformDeleted: DeleteAccountResult["platformDeleted"]}>}> {
+): Promise<{
+  total: number;
+  deleted: number;
+  failures: Array<{id: number; message: string}>;
+  perAccount: Array<{
+    id: number;
+    email: string;
+    platformErrors: DeleteAccountResult["platformErrors"];
+    platformDeleted: DeleteAccountResult["platformDeleted"];
+    platformSkipped: DeleteAccountResult["platformSkipped"];
+  }>;
+}> {
   const uniqueIds = [...new Set(ids.map(Number).filter((v) => Number.isFinite(v) && v > 0))];
   const failures: Array<{id: number; message: string}> = [];
-  const perAccount: Array<{id: number; email: string; platformErrors: DeleteAccountResult["platformErrors"]; platformDeleted: DeleteAccountResult["platformDeleted"]}> = [];
+  const perAccount: Array<{
+    id: number;
+    email: string;
+    platformErrors: DeleteAccountResult["platformErrors"];
+    platformDeleted: DeleteAccountResult["platformDeleted"];
+    platformSkipped: DeleteAccountResult["platformSkipped"];
+  }> = [];
   let deleted = 0;
   for (const id of uniqueIds) {
     try {
       const result = await deleteAccount(id, options);
       deleted += 1;
-      perAccount.push({id, email: result.email, platformErrors: result.platformErrors, platformDeleted: result.platformDeleted});
+      perAccount.push({
+        id,
+        email: result.email,
+        platformErrors: result.platformErrors,
+        platformDeleted: result.platformDeleted,
+        platformSkipped: result.platformSkipped,
+      });
     } catch (error) {
       failures.push({id, message: error instanceof Error ? error.message : String(error)});
     }

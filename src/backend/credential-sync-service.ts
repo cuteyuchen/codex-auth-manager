@@ -6,6 +6,63 @@ import {checkAccount, decodeJwtClaims, mapWithConcurrency, resolveDefaultConcurr
 import {addJobEvent} from "./job-service.js";
 import {ensureAccountPlatformBinding} from "./account-platform-binding-service.js";
 
+// ─── 内置系统邮箱来源 ──────────────────────────────────
+const SYSTEM_MAIL_SOURCE_NAME = "平台同步导入/未归类";
+
+/**
+ * 确保内置系统邮箱来源存在，返回 source_id
+ * 使用 gptmail 作为 provider（最小侵入，来源 ≠ provider）
+ */
+function ensureSystemMailSource(): number {
+  const existing = getDb().prepare(
+    "SELECT id FROM mail_sources WHERE name = ?",
+  ).get(SYSTEM_MAIL_SOURCE_NAME) as {id: number} | undefined;
+  if (existing) {
+    return existing.id;
+  }
+  const timestamp = currentTimestamp();
+  const mailType = getDb().prepare(
+    "SELECT id FROM mail_types WHERE key = 'gptmail'",
+  ).get() as {id: number} | undefined;
+  const result = getDb().prepare(`
+    INSERT INTO mail_sources (name, provider, mail_type_id, enabled, supports_auto_code, config_encrypted, created_at, updated_at)
+    VALUES (?, 'gptmail', ?, 1, 0, NULL, ?, ?)
+  `).run(SYSTEM_MAIL_SOURCE_NAME, mailType?.id ?? null, timestamp, timestamp);
+  return Number(result.lastInsertRowid);
+}
+
+/**
+ * 为邮箱地址创建或复用一个 mailbox，绑定到给定 account
+ * 如果 account 已有 mailbox_id 则不覆盖
+ * 如果邮箱已存在 mailbox 则复用
+ */
+async function ensureMailboxForAccount(accountId: number, email: string): Promise<void> {
+  const account = getDb().prepare("SELECT mailbox_id FROM accounts WHERE id = ?").get(accountId) as {mailbox_id: number | null} | undefined;
+  if (account?.mailbox_id) {
+    return; // 已有绑定，不覆盖
+  }
+  const sourceId = ensureSystemMailSource();
+  const timestamp = currentTimestamp();
+  // 检查是否已有该邮箱的 mailbox
+  const existing = getDb().prepare(
+    "SELECT id FROM mailboxes WHERE source_id = ? AND email = ?",
+  ).get(sourceId, email) as {id: number} | undefined;
+  let mailboxId: number;
+  if (existing) {
+    mailboxId = existing.id;
+  } else {
+    const result = getDb().prepare(`
+      INSERT INTO mailboxes (source_id, mail_type_id, email, provider, status, used, created_at, updated_at)
+      VALUES (?, NULL, ?, 'gptmail', 'unused', 0, ?, ?)
+    `).run(sourceId, email, timestamp, timestamp);
+    mailboxId = Number(result.lastInsertRowid);
+  }
+  // 绑定 account.mailbox_id
+  getDb().prepare(
+    "UPDATE accounts SET mailbox_id = ?, updated_at = ? WHERE id = ?",
+  ).run(mailboxId, timestamp, accountId);
+}
+
 export type CredentialSyncSource = "all" | IntegrationServiceKind;
 
 export interface CredentialSyncOptions {
@@ -178,6 +235,11 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
     if (credential.service.id) {
       ensureAccountPlatformBinding(targetAccountId, credential.service.id);
     }
+    // 为同步导入的账号创建/绑定 mailbox（不覆盖已有绑定）
+    const emailForMailbox = resolveRecordEmail(credential.record);
+    if (emailForMailbox) {
+      await ensureMailboxForAccount(targetAccountId, emailForMailbox);
+    }
     resolveActivePlatformCredential(targetAccountId);
     return {accountId: targetAccountId, action: "updated"};
   }
@@ -193,6 +255,11 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
   });
   if (credential.service.id) {
     ensureAccountPlatformBinding(account.id, credential.service.id);
+  }
+  // 为新导入的账号创建/绑定 mailbox
+  const emailForMailbox = resolveRecordEmail(credential.record);
+  if (emailForMailbox) {
+    await ensureMailboxForAccount(account.id, emailForMailbox);
   }
   resolveActivePlatformCredential(account.id);
   return {accountId: account.id, action: "imported"};
@@ -323,7 +390,7 @@ async function checkSyncedAccounts(accountIds: number[], jobId?: number): Promis
   }
   const outcomes = await mapWithConcurrency(uniqueIds, resolveDefaultConcurrency(uniqueIds.length), async (accountId) => {
     try {
-      await checkAccount(accountId, false);
+      await checkAccount(accountId, {forceRefresh: false, triggerAutoReauth: false});
       return true;
     } catch (error) {
       const account = getDb().prepare("SELECT credential_source_kind FROM accounts WHERE id = ?").get(accountId) as {credential_source_kind: string | null} | undefined;

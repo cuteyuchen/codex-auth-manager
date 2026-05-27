@@ -106,6 +106,23 @@ function normalizeRecipientList(recipient: string | string[] | undefined): strin
   return normalized ? [normalized] : [];
 }
 
+function mailboxMatchesTarget(candidate: string, target: string): boolean {
+  const normalizedCandidate = normalizeMailbox(candidate);
+  const normalizedTarget = normalizeMailbox(target);
+  if (!normalizedCandidate || !normalizedTarget) {
+    return false;
+  }
+  if (normalizedCandidate === normalizedTarget) {
+    return true;
+  }
+  const [candidateLocal, candidateDomain] = normalizedCandidate.split("@");
+  const [targetLocal, targetDomain] = normalizedTarget.split("@");
+  if (!candidateLocal || !targetLocal || candidateDomain !== targetDomain) {
+    return false;
+  }
+  return candidateLocal.split("+")[0] === targetLocal.split("+")[0];
+}
+
 function collectCandidateTexts(mail: VerificationMailCandidate): string[] {
   const texts = [mail.subject ?? "", mail.content ?? "", ...(mail.extraTexts ?? [])];
   return texts
@@ -134,7 +151,7 @@ export function findLatestVerificationMail<T extends VerificationMailCandidate>(
   for (const mail of sorted) {
     if (targetEmail) {
       const recipients = normalizeRecipientList(mail.recipient);
-      if (recipients.length > 0 && !recipients.includes(targetEmail)) {
+      if (recipients.length > 0 && !recipients.some((recipient) => mailboxMatchesTarget(recipient, targetEmail))) {
         continue;
       }
     }

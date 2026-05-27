@@ -2,7 +2,7 @@
 import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from "vue";
 import {useRouter} from "vue-router";
 import {ElMessage} from "element-plus";
-import {Delete, Download, Refresh, Search, Setting} from "@element-plus/icons-vue";
+import {Delete, Download, Refresh, Setting} from "@element-plus/icons-vue";
 import {
   apiGet,
   apiSend,
@@ -10,11 +10,19 @@ import {
   type BoundPlatformService,
   type IntegrationService,
   type MailSource,
-  type UsageWindow,
 } from "../api";
 import ReauthDialog from "../components/ReauthDialog.vue";
 import SyncDialog from "../components/SyncDialog.vue";
 import DeleteAccountDialog from "../components/DeleteAccountDialog.vue";
+import StatusCell from "../components/accounts/StatusCell.vue";
+import CredentialCell from "../components/accounts/CredentialCell.vue";
+import UsageCell from "../components/accounts/UsageCell.vue";
+import MailBindingCell from "../components/accounts/MailBindingCell.vue";
+import PlatformBindingsCell from "../components/accounts/PlatformBindingsCell.vue";
+import StepCell from "../components/accounts/StepCell.vue";
+import RowActions from "../components/accounts/RowActions.vue";
+import BulkActionsBar from "../components/accounts/BulkActionsBar.vue";
+import FilterBar from "../components/accounts/FilterBar.vue";
 
 const router = useRouter();
 const accounts = ref<Account[]>([]);
@@ -66,22 +74,6 @@ const filters = reactive({
   pushStatus: "",
 });
 
-const statusOptions = [
-  {label: "正常", value: "authorized", type: "success"},
-  {label: "额度已用尽", value: "quota_exhausted", type: "warning"},
-  {label: "凭据过期", value: "credential_expired", type: "danger"},
-  {label: "账号异常", value: "account_abnormal", type: "danger"},
-  {label: "需要人工重登", value: "needs_manual_reauth", type: "danger"},
-  {label: "未检查", value: "unchecked", type: "info"},
-  {label: "只保存 accessToken", value: "access_token_only", type: "primary"},
-];
-
-const credentialOptions = [
-  {label: "已授权 Codex auth", value: "codex_auth"},
-  {label: "只保存 accessToken", value: "access_token_only"},
-  {label: "无凭据", value: "none"},
-];
-
 const pushTargets = [
   {label: "CPA", value: "cpa"},
   {label: "Sub2API", value: "sub2api"},
@@ -93,18 +85,14 @@ const pagedAccounts = computed(() => accounts.value.slice((currentPage.value - 1
 const pagedAccountIds = computed(() => pagedAccounts.value.map((item) => item.id));
 const enabledServices = computed(() => services.value.filter((service) => service.enabled));
 const availablePushServices = computed(() => services.value.filter((service) => {
-  if (!service.enabled) {
-    return false;
-  }
+  if (!service.enabled) return false;
   return pushTarget.value === "both" || service.kind === pushTarget.value;
 }));
 
 function buildQuery() {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
-    if (value !== "") {
-      params.set(key, value);
-    }
+    if (value !== "") params.set(key, value);
   }
   if (bindingFilterServiceIds.value.length) {
     params.set("bindingServiceIds", bindingFilterServiceIds.value.join(","));
@@ -121,12 +109,8 @@ async function load(silent = false, checkCurrentPage = false) {
     if ((currentPage.value - 1) * pageSize.value >= accounts.value.length) {
       currentPage.value = 1;
     }
-    if (!silent) {
-      ElMessage.success("账号列表已刷新");
-    }
-    if (checkCurrentPage) {
-      schedulePoll();
-    }
+    if (!silent) ElMessage.success("账号列表已刷新");
+    if (checkCurrentPage) schedulePoll();
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
@@ -136,9 +120,7 @@ async function load(silent = false, checkCurrentPage = false) {
 
 async function autoCheckCurrentPage() {
   if (!autoPoll.value || autoChecking.value || !pagedAccountIds.value.length) {
-    if (autoChecking.value) {
-      pendingAutoCheck = true;
-    }
+    if (autoChecking.value) pendingAutoCheck = true;
     return;
   }
   autoChecking.value = true;
@@ -151,9 +133,7 @@ async function autoCheckCurrentPage() {
       while (nextIndex < ids.length) {
         const id = ids[nextIndex];
         nextIndex += 1;
-        if (!id) {
-          continue;
-        }
+        if (!id) continue;
         try {
           await apiSend(`/api/accounts/${id}/check`, "POST");
         } catch {
@@ -195,17 +175,18 @@ async function loadMailSources() {
 }
 
 function resetFilters() {
-  Object.assign(filters, {
-    q: "",
-    status: "",
-    credentialType: "",
-    plan: "",
-    autoReauth: "",
-    pushStatus: "",
-  });
+  Object.assign(filters, {q: "", status: "", credentialType: "", plan: "", autoReauth: "", pushStatus: ""});
   bindingFilterServiceIds.value = [];
   currentPage.value = 1;
   void load(false, true);
+}
+
+function onFiltersUpdate(value: typeof filters) {
+  Object.assign(filters, value);
+}
+
+function onBindingFilterUpdate(value: number[]) {
+  bindingFilterServiceIds.value = value;
 }
 
 async function importAuth() {
@@ -227,13 +208,9 @@ function openSync() {
 }
 
 function filenameFromDisposition(disposition: string | null, fallback: string) {
-  if (!disposition) {
-    return fallback;
-  }
+  if (!disposition) return fallback;
   const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
-  if (encoded) {
-    return decodeURIComponent(encoded);
-  }
+  if (encoded) return decodeURIComponent(encoded);
   const plain = disposition.match(/filename="?([^"]+)"?/i)?.[1];
   return plain || fallback;
 }
@@ -257,21 +234,19 @@ async function downloadAuth(ids: number[]) {
   loading.value = true;
   try {
     const response = ids.length === 1
-        ? await fetch(`/api/accounts/${ids[0]}/auth-file`)
-        : await fetch("/api/accounts/export-auth", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ids}),
-        });
+      ? await fetch(`/api/accounts/${ids[0]}/auth-file`)
+      : await fetch("/api/accounts/export-auth", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ids}),
+      });
     if (!response.ok) {
       const text = await response.text();
       try {
-        const payload = JSON.parse(text) as { error?: string };
+        const payload = JSON.parse(text) as {error?: string};
         throw new Error(payload.error || text);
       } catch (error) {
-        if (error instanceof SyntaxError) {
-          throw new Error(text);
-        }
+        if (error instanceof SyntaxError) throw new Error(text);
         throw error;
       }
     }
@@ -286,24 +261,11 @@ async function downloadAuth(ids: number[]) {
   }
 }
 
-async function single(
-    id: number,
-    action: "check" | "refresh" | "push",
-    target: "cpa" | "sub2api" | "both" = "both",
-    serviceIds?: number[],
-) {
+async function singleCheck(id: number) {
   rowActionLoading.value = new Set([...rowActionLoading.value, id]);
   try {
-    if (action === "check") {
-      await apiSend(`/api/accounts/${id}/check`, "POST");
-      ElMessage.success("检查完成");
-    } else if (action === "refresh") {
-      await apiSend(`/api/accounts/${id}/refresh`, "POST");
-      ElMessage.success("刷新完成");
-    } else {
-      await apiSend(`/api/accounts/${id}/push`, "POST", {target, serviceIds});
-      ElMessage.success("推送完成");
-    }
+    await apiSend(`/api/accounts/${id}/check`, "POST");
+    ElMessage.success("检查完成");
     await load(true);
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
@@ -314,18 +276,59 @@ async function single(
   }
 }
 
-async function bulk(
-    action: "check" | "refresh" | "reauth" | "push",
-    target: "cpa" | "sub2api" | "both" = "both",
-    serviceIds?: number[],
-) {
+async function singleRepair(id: number) {
+  rowActionLoading.value = new Set([...rowActionLoading.value, id]);
+  try {
+    const result = await apiSend<{job: {id: number}}>(`/api/accounts/${id}/check`, "POST", {repair: true});
+    ElMessage.success(`修复任务已创建 #${result.job.id}`);
+    await router.push("/jobs");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    const next = new Set(rowActionLoading.value);
+    next.delete(id);
+    rowActionLoading.value = next;
+  }
+}
+
+async function singleRefresh(id: number) {
+  rowActionLoading.value = new Set([...rowActionLoading.value, id]);
+  try {
+    await apiSend(`/api/accounts/${id}/refresh`, "POST");
+    ElMessage.success("刷新完成");
+    await load(true);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    const next = new Set(rowActionLoading.value);
+    next.delete(id);
+    rowActionLoading.value = next;
+  }
+}
+
+async function singlePush(id: number, target: "cpa" | "sub2api" | "both" = "both", serviceIds?: number[]) {
+  rowActionLoading.value = new Set([...rowActionLoading.value, id]);
+  try {
+    await apiSend(`/api/accounts/${id}/push`, "POST", {target, serviceIds});
+    ElMessage.success("推送完成");
+    await load(true);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    const next = new Set(rowActionLoading.value);
+    next.delete(id);
+    rowActionLoading.value = next;
+  }
+}
+
+async function bulk(action: "check" | "refresh" | "reauth" | "push" | "repair", target: "cpa" | "sub2api" | "both" = "both", serviceIds?: number[]) {
   if (!selectedIds.value.length) {
     ElMessage.warning("请先选择账号");
     return;
   }
   bulkActionLoading.value = true;
   try {
-    const result = await apiSend<{ job: { id: number } }>(`/api/accounts/bulk/${action}`, "POST", {
+    const result = await apiSend<{job: {id: number}}>(`/api/accounts/bulk/${action}`, "POST", {
       ids: selectedIds.value,
       target,
       serviceIds,
@@ -380,9 +383,7 @@ async function confirmBindings() {
   bindingSubmitting.value = true;
   try {
     if (bindingScope.value === "single") {
-      if (!activeAccount.value) {
-        return;
-      }
+      if (!activeAccount.value) return;
       await apiSend(`/api/accounts/${activeAccount.value.id}/platform-bindings`, "PUT", {
         serviceIds: selectedBindingServiceIds.value,
         mode: bindingMode.value,
@@ -409,10 +410,8 @@ async function confirmPush() {
   pushSubmitting.value = true;
   try {
     if (pushScope.value === "single") {
-      if (!activeAccount.value) {
-        return;
-      }
-      await single(activeAccount.value.id, "push", pushTarget.value, selectedServiceIds.value);
+      if (!activeAccount.value) return;
+      await singlePush(activeAccount.value.id, pushTarget.value, selectedServiceIds.value);
     } else {
       await bulk("push", pushTarget.value, selectedServiceIds.value);
     }
@@ -432,7 +431,7 @@ function openProfile(row: Account) {
   if (row.has_password) {
     void (async () => {
       try {
-        const payload = await apiGet<{ hasPassword: boolean; password: string }>(`/api/accounts/${row.id}/password`);
+        const payload = await apiGet<{hasPassword: boolean; password: string}>(`/api/accounts/${row.id}/password`);
         if (activeAccount.value?.id === row.id && profileDialog.value) {
           passwordValue.value = payload.password ?? "";
         }
@@ -444,14 +443,10 @@ function openProfile(row: Account) {
 }
 
 async function saveProfile() {
-  if (!activeAccount.value) {
-    return;
-  }
+  if (!activeAccount.value) return;
   profileSubmitting.value = true;
   try {
-    const payload: { password?: string; sourceId: number | null } = {
-      sourceId: accountSourceId.value,
-    };
+    const payload: {password?: string; sourceId: number | null} = {sourceId: accountSourceId.value};
     if (clearPassword.value) {
       payload.password = "";
     } else if (passwordValue.value) {
@@ -505,83 +500,18 @@ function onDeleted() {
   void load(true);
 }
 
-function statusTag(row: Account) {
-  const status = row.status_code || row.status;
-  const match = statusOptions.find((item) => item.value === status);
-  return {
-    label: row.status_label || match?.label || status || "未知",
-    type: match?.type || "info",
-  };
+function formatDate(value: string | null | undefined) {
+  if (!value) return "-";
+  return new Date(value).toLocaleString();
 }
 
-function credentialLabel(row: Account) {
-  const value = row.credential_type || row.auth_credential_type || "none";
-  return credentialOptions.find((item) => item.value === value)?.label || value;
+function accountSourceLabel(row: Account) {
+  if (row.source_name) return `${row.source_name}${row.source_provider ? ` / ${row.source_provider}` : ""}`;
+  return "-";
 }
 
 function bindingLabel(binding: BoundPlatformService) {
   return `${binding.kind === "cpa" ? "CPA" : "Sub2API"} / ${binding.name}`;
-}
-
-function bindingTagType(binding: BoundPlatformService): "" | "success" | "warning" | "info" | "danger" {
-  if (binding.lastPushStatus === "success") {
-    return "success";
-  }
-  if (binding.lastPushStatus === "failed") {
-    return "danger";
-  }
-  return "info";
-}
-
-function accountSourceLabel(row: Account) {
-  if (row.source_name) {
-    return `${row.source_name}${row.source_provider ? ` / ${row.source_provider}` : ""}`;
-  }
-  return "-";
-}
-
-function formatPercent(value: number | null | undefined) {
-  return typeof value === "number" ? `${value.toFixed(2)}%` : "未返回";
-}
-
-function formatDate(value: string | null | undefined) {
-  if (!value) {
-    return "-";
-  }
-  return new Date(value).toLocaleString();
-}
-
-function formatResetAt(value: string | null | undefined) {
-  if (!value) {
-    return "重置 -";
-  }
-  return `重置 ${new Date(value).toLocaleString()}`;
-}
-
-function usageWindows(row: Account): UsageWindow[] {
-  const plan = String(row.plan ?? "").toLowerCase();
-  const isFree = !plan || plan.includes("free");
-  if (row.usage_windows?.length) {
-    const windows = row.usage_windows.map((item) => ({
-      ...item,
-      label: item.window_key === "primary" ? "5小时" : item.window_key === "secondary" ? "7天" : item.label,
-    }));
-    if (isFree) {
-      return windows.filter((item) => item.label.includes("7") || item.window_key === "secondary").slice(0, 1);
-    }
-    return windows;
-  }
-  if (row.remaining_percent != null || row.used_percent != null) {
-    return [{
-      window_key: "primary",
-      label: isFree ? "7天" : "5小时",
-      used_percent: row.used_percent,
-      remaining_percent: row.remaining_percent,
-      reset_at: row.reset_at,
-      limit_reached: null,
-    }];
-  }
-  return [];
 }
 
 function schedulePoll() {
@@ -589,9 +519,7 @@ function schedulePoll() {
     window.clearInterval(timer);
     timer = undefined;
   }
-  if (!autoPoll.value) {
-    return;
-  }
+  if (!autoPoll.value) return;
   void autoCheckCurrentPage();
   timer = window.setInterval(() => void autoCheckCurrentPage(), Math.max(15, pollSeconds.value) * 1000);
 }
@@ -607,9 +535,7 @@ watch(pushTarget, () => {
 });
 
 onBeforeUnmount(() => {
-  if (timer) {
-    window.clearInterval(timer);
-  }
+  if (timer) window.clearInterval(timer);
 });
 
 watch(pageSize, () => {
@@ -636,63 +562,26 @@ watch(currentPage, () => {
       </div>
     </div>
 
+    <!-- 筛选区 -->
     <el-card shadow="never" class="mb-4">
-      <el-form :model="filters" label-position="left" class="filter-form">
-        <div class="filter-grid">
-          <el-form-item label="关键词">
-            <el-input v-model="filters.q" clearable placeholder="邮箱/状态" @keyup.enter="load(false, true)"/>
-          </el-form-item>
-          <el-form-item label="状态">
-            <el-select v-model="filters.status" clearable placeholder="全部" class="w-full">
-              <el-option v-for="item in statusOptions" :key="item.value" :label="item.label" :value="item.value"/>
-            </el-select>
-          </el-form-item>
-          <el-form-item label="凭据">
-            <el-select v-model="filters.credentialType" clearable placeholder="全部" class="w-full">
-              <el-option v-for="item in credentialOptions" :key="item.value" :label="item.label" :value="item.value"/>
-            </el-select>
-          </el-form-item>
-          <el-form-item label="绑定平台">
-            <el-select v-model="bindingFilterServiceIds" multiple collapse-tags clearable filterable class="w-full"
-                       placeholder="全部">
-              <el-option v-for="service in enabledServices" :key="service.id"
-                         :label="`${service.kind === 'cpa' ? 'CPA' : 'Sub2API'} / ${service.name}`"
-                         :value="service.id"/>
-            </el-select>
-          </el-form-item>
-          <el-form-item label="套餐">
-            <el-input v-model="filters.plan" clearable placeholder="free/plus"/>
-          </el-form-item>
-          <el-form-item label="自动重登">
-            <el-select v-model="filters.autoReauth" clearable placeholder="全部" class="w-full">
-              <el-option label="开启" value="true"/>
-              <el-option label="关闭" value="false"/>
-            </el-select>
-          </el-form-item>
-          <el-form-item label="推送">
-            <el-select v-model="filters.pushStatus" clearable placeholder="全部" class="w-full">
-              <el-option label="已推送" value="pushed"/>
-              <el-option label="未推送" value="not_pushed"/>
-            </el-select>
-          </el-form-item>
-          <el-form-item>
-            <div class="filter-actions flex w-full gap-2">
-              <el-button :icon="Search" type="primary" class="flex-1" @click="load(false, true)">筛选</el-button>
-              <el-button class="flex-1" @click="resetFilters">重置</el-button>
-            </div>
-          </el-form-item>
-        </div>
-      </el-form>
+      <FilterBar :filters="filters" :binding-filter-service-ids="bindingFilterServiceIds"
+                 :enabled-services="enabledServices"
+                 @search="load(false, true)"
+                 @reset="resetFilters"
+                 @update:filters="onFiltersUpdate"
+                 @update:binding-filter-service-ids="onBindingFilterUpdate"/>
+
+      <!-- 批量操作条 + 自动刷新 -->
       <div class="mt-1 flex flex-wrap items-center justify-between gap-3">
-        <div class="flex flex-wrap gap-1.5">
-          <el-button :loading="bulkActionLoading" @click="bulk('check')">批量检查</el-button>
-          <el-button :loading="bulkActionLoading" @click="bulk('refresh')">批量刷新</el-button>
-          <el-button :loading="bulkActionLoading" @click="bulk('reauth')">批量自动重登</el-button>
-          <el-button :loading="bulkActionLoading" @click="openPush()">批量推送</el-button>
-          <el-button :loading="bulkActionLoading" @click="openBindings()">批量绑定平台</el-button>
-          <el-button :loading="bulkActionLoading" @click="downloadAuth(selectedIds)">批量导出</el-button>
-          <el-button type="danger" plain :icon="Delete" :disabled="bulkActionLoading" @click="openDeleteBulk">批量删除</el-button>
-        </div>
+        <BulkActionsBar :loading="bulkActionLoading" :selected-count="selectedIds.length"
+                        @check="bulk('check')"
+                        @repair="bulk('repair')"
+                        @refresh="bulk('refresh')"
+                        @reauth="bulk('reauth')"
+                        @push="openPush()"
+                        @bindings="openBindings()"
+                        @export="downloadAuth(selectedIds)"
+                        @delete="openDeleteBulk"/>
         <div class="flex items-center gap-2">
           <el-switch v-model="autoPoll" active-text="自动检查当前页" :loading="autoChecking" @change="schedulePoll"/>
           <el-input-number v-model="pollSeconds" :min="15" :max="600" size="small" :disabled="autoChecking"
@@ -702,108 +591,55 @@ watch(currentPage, () => {
       </div>
     </el-card>
 
+    <!-- 数据表格 -->
     <el-card shadow="never">
       <div class="data-table-wrap">
         <el-table v-loading="loading" :data="pagedAccounts" border row-key="id" class="w-full"
                   @selection-change="selected = $event">
           <el-table-column type="selection" width="46"/>
-          <el-table-column label="邮箱" min-width="240" show-overflow-tooltip>
+          <el-table-column label="邮箱" min-width="220" show-overflow-tooltip>
             <template #default="{row}">
-              <div class="flex flex-col">
-                <span class="text-sm font-medium">{{ row.email }}</span>
-                <span class="text-xs text-slate-500">{{ credentialLabel(row) }}</span>
-              </div>
+              <CredentialCell :row="row"/>
             </template>
           </el-table-column>
           <el-table-column label="状态" min-width="170">
             <template #default="{row}">
-              <div class="flex flex-col gap-1">
-                <el-tag :type="statusTag(row).type" size="small">{{ statusTag(row).label }}</el-tag>
-                <el-tag v-if="row.needs_manual_reauth" type="danger" size="small" effect="dark">需要人工重登</el-tag>
-                <span class="text-xs text-slate-500">检查 {{ formatDate(row.last_check_at) }}</span>
-                <el-tooltip v-if="row.last_error" :content="row.last_error" placement="top">
-                  <span class="text-xs text-rose-500 line-clamp-1">{{ row.last_error }}</span>
-                </el-tooltip>
-              </div>
+              <StatusCell :row="row"/>
             </template>
           </el-table-column>
-          <el-table-column label="绑定平台" min-width="240">
+          <el-table-column label="绑定平台" min-width="200">
             <template #default="{row}">
-              <div v-if="row.platform_bindings?.length" class="flex flex-wrap gap-1">
-                <el-tooltip v-for="binding in row.platform_bindings" :key="binding.id"
-                            :content="`最近推送: ${binding.lastPushStatus || '-'}${binding.lastPushAt ? ' @ ' + formatDate(binding.lastPushAt) : ''}${binding.lastPushMessage ? '\n' + binding.lastPushMessage : ''}`"
-                            placement="top">
-                  <el-tag :type="bindingTagType(binding)" size="small" effect="plain">
-                    {{ bindingLabel(binding) }}
-                  </el-tag>
-                </el-tooltip>
-              </div>
-              <span v-else class="text-slate-400">未绑定</span>
+              <PlatformBindingsCell :row="row"/>
             </template>
           </el-table-column>
-          <el-table-column label="邮箱来源" min-width="180" show-overflow-tooltip>
+          <el-table-column label="邮箱 / 邮箱绑定" min-width="200" show-overflow-tooltip>
             <template #default="{row}">
-              <div class="text-sm">{{ accountSourceLabel(row) }}</div>
-              <div v-if="row.source_vendor || row.source_batch_note" class="text-xs text-slate-500">
-                {{ [row.source_vendor, row.source_batch_note].filter(Boolean).join(" / ") }}
-              </div>
-              <div class="text-xs text-slate-400">
-                密码 {{ row.has_password ? "已保存" : "未保存" }} · 自动重登 {{ row.auto_reauth ? "开启" : "关闭" }}
-              </div>
+              <MailBindingCell :row="row"/>
             </template>
           </el-table-column>
           <el-table-column label="套餐 / 剩余" min-width="280">
             <template #default="{row}">
-              <div class="text-xs text-slate-500">{{ row.plan || "-" }}</div>
-              <div v-if="usageWindows(row).length" class="mt-1 space-y-1">
-                <div v-for="window in usageWindows(row)" :key="window.window_key">
-                  <div class="flex items-center gap-2">
-                    <span class="w-10 text-xs text-slate-500">{{ window.label }}</span>
-                    <el-progress :percentage="Math.max(0, Math.min(100, window.remaining_percent ?? 0))"
-                                 :stroke-width="8" class="min-w-24 flex-1"/>
-                    <span class="w-16 text-xs">{{ formatPercent(window.remaining_percent) }}</span>
-                  </div>
-                  <div class="ml-12 text-xs text-slate-500">{{ formatResetAt(window.reset_at) }}</div>
-                </div>
-              </div>
-              <span v-else class="text-slate-400">未返回</span>
+              <UsageCell :row="row"/>
             </template>
           </el-table-column>
           <el-table-column label="凭据步骤" min-width="170" show-overflow-tooltip>
             <template #default="{row}">
-              <el-tag
-                  :type="row.step_status === 'failed' ? 'danger' : row.step_status === 'success' ? 'success' : 'warning'"
-                  size="small" effect="plain">
-                {{ row.current_step || "未检查" }}
-              </el-tag>
-              <div class="text-xs text-slate-500">{{ formatDate(row.last_step_at) }}</div>
+              <StepCell :row="row"/>
             </template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="260">
+          <el-table-column label="操作" fixed="right" width="220">
             <template #default="{row}">
-              <div class="table-actions">
-                <el-button link type="primary" :loading="rowActionLoading.has(row.id)" @click="single(row.id, 'check')">检查</el-button>
-                <el-button link type="primary" :loading="rowActionLoading.has(row.id)" @click="single(row.id, 'refresh')">刷新</el-button>
-                <el-dropdown trigger="click" @command="(mode: 'auto' | 'manual') => openReauth(row, mode)">
-                  <el-button link :type="row.needs_manual_reauth ? 'danger' : 'warning'">重登
-                    <el-icon class="el-icon--right">
-                      <i-ep-arrow-down/>
-                    </el-icon>
-                  </el-button>
-                  <template #dropdown>
-                    <el-dropdown-menu>
-                      <el-dropdown-item command="auto">自动重登（密码 + 邮箱验证码）</el-dropdown-item>
-                      <el-dropdown-item command="manual">人工重登（OAuth 回填）</el-dropdown-item>
-                    </el-dropdown-menu>
-                  </template>
-                </el-dropdown>
-                <el-button link type="primary" @click="openPush(row)">推送</el-button>
-                <el-button link type="primary" @click="openBindings(row)">绑定</el-button>
-                <el-button link type="primary" @click="openProfile(row)">编辑</el-button>
-                <el-button link type="primary" @click="openDetail(row)">详情</el-button>
-                <el-button link type="primary" @click="downloadAuth([row.id])">导出</el-button>
-                <el-button link type="danger" @click="openDeleteSingle(row)">删除</el-button>
-              </div>
+              <RowActions :row="row" :loading="rowActionLoading.has(row.id)"
+                          @check="singleCheck"
+                          @repair="singleRepair"
+                          @refresh="singleRefresh"
+                          @reauth="(r, m) => openReauth(r, m)"
+                          @push="(r) => openPush(r)"
+                          @bindings="(r) => openBindings(r)"
+                          @profile="(r) => openProfile(r)"
+                          @detail="(r) => openDetail(r)"
+                          @export="(id) => downloadAuth([id])"
+                          @delete="(r) => openDeleteSingle(r)"/>
             </template>
           </el-table-column>
         </el-table>
@@ -815,6 +651,7 @@ watch(currentPage, () => {
       </div>
     </el-card>
 
+    <!-- 编辑账号资料 -->
     <el-dialog v-model="profileDialog" title="编辑账号资料" width="480px">
       <el-alert title="密码会加密保存，本页面不会回显明文；留空表示不修改已保存密码。" type="info" show-icon class="mb-3"/>
       <el-form label-position="top">
@@ -839,6 +676,7 @@ watch(currentPage, () => {
       </template>
     </el-dialog>
 
+    <!-- 推送选择 -->
     <el-dialog v-model="pushDialog" title="选择推送平台" width="440px">
       <el-alert title="不选择具体服务时，会按启用服务优先级推送；若没有服务，则回退到配置页的单组 CPA/Sub2API 配置。"
                 type="info" show-icon class="mb-4"/>
@@ -869,6 +707,7 @@ watch(currentPage, () => {
 
     <SyncDialog v-model="syncDialogVisible" :services="services" @finished="onSyncFinished"/>
 
+    <!-- 绑定平台 -->
     <el-dialog v-model="bindingDialog" title="设置同步平台" width="540px">
       <el-alert title="账号过期并自动重登成功后，只会回推到这里绑定的平台；未绑定账号不会自动推送。" type="info" show-icon
                 class="mb-4"/>
@@ -899,13 +738,16 @@ watch(currentPage, () => {
 
     <DeleteAccountDialog v-model="deleteDialogVisible" :accounts="deleteTargets" @deleted="onDeleted"/>
 
+    <!-- 账号详情 -->
     <el-dialog v-model="detailDialog" title="账号详情" width="720px">
       <template v-if="activeAccount">
         <el-descriptions :column="2" border>
           <el-descriptions-item label="邮箱">{{ activeAccount.email }}</el-descriptions-item>
           <el-descriptions-item label="Provider">{{ activeAccount.provider || "-" }}</el-descriptions-item>
-          <el-descriptions-item label="状态">{{ statusTag(activeAccount).label }}</el-descriptions-item>
-          <el-descriptions-item label="凭据">{{ credentialLabel(activeAccount) }}</el-descriptions-item>
+          <el-descriptions-item label="状态">{{ activeAccount.status_label || activeAccount.status }}</el-descriptions-item>
+          <el-descriptions-item label="凭据">
+            {{ activeAccount.credential_type || activeAccount.auth_credential_type || "none" }}
+          </el-descriptions-item>
           <el-descriptions-item label="是否需要人工重登">
             <el-tag v-if="activeAccount.needs_manual_reauth" type="danger">是</el-tag>
             <span v-else>否</span>
@@ -915,13 +757,17 @@ watch(currentPage, () => {
           <el-descriptions-item label="凭据来源">
             {{
               activeAccount.credential_source_kind && activeAccount.credential_source_kind !== "local"
-                  ? `${activeAccount.credential_source_kind === "cpa" ? "CPA" : "Sub2API"}${activeAccount.credential_source_name ? " / " + activeAccount.credential_source_name : ""}`
-                  : "本地"
+                ? `${activeAccount.credential_source_kind === "cpa" ? "CPA" : "Sub2API"}${activeAccount.credential_source_name ? " / " + activeAccount.credential_source_name : ""}`
+                : "本地"
             }}
           </el-descriptions-item>
           <el-descriptions-item label="最近同步">{{ formatDate(activeAccount.credential_synced_at) }}</el-descriptions-item>
           <el-descriptions-item label="账号密码">{{ activeAccount.has_password ? "已保存" : "未保存" }}</el-descriptions-item>
           <el-descriptions-item label="邮箱来源">{{ accountSourceLabel(activeAccount) }}</el-descriptions-item>
+          <el-descriptions-item label="绑定邮箱">
+            <el-tag v-if="activeAccount.mailbox_id" type="success" size="small">已绑定 #{{ activeAccount.mailbox_id }}</el-tag>
+            <span v-else class="text-slate-400">未绑定</span>
+          </el-descriptions-item>
           <el-descriptions-item label="绑定平台" :span="2">
             <span v-if="!activeAccount.platform_bindings?.length">-</span>
             <span v-else>{{ activeAccount.platform_bindings.map(bindingLabel).join("，") }}</span>

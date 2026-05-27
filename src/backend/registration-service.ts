@@ -27,6 +27,7 @@ import {getDb, currentTimestamp} from "./db.js";
 import {
   consumeReservedMailbox,
   createDatabaseMailboxProvider,
+  createMailboxProviderById,
   markMailboxUsed,
   setMailboxLastError,
 } from "./mailbox-service.js";
@@ -158,13 +159,16 @@ async function removeSuccessfulEmail(email: string): Promise<void> {
 async function importAuthFileFromResult(
   authFile?: string,
   password?: string,
-  options: {sourceId?: number | null; mailboxId?: number | null} = {},
+  options: {accountId?: number; sourceId?: number | null; mailboxId?: number | null} = {},
 ): Promise<{accountId: number; email: string} | null> {
   if (!authFile) {
     return null;
   }
   const record = await loadAuthRecord(authFile);
-  const account = await upsertAccountFromAuthRecord(record, authFile);
+  const account = await upsertAccountFromAuthRecord(record, authFile, {
+    accountId: options.accountId,
+    preserveSource: Boolean(options.accountId),
+  });
   if (password) {
     await setAccountPassword(account.id, password);
   }
@@ -676,16 +680,25 @@ export async function reauthorizeAccount(
   const account = getAccount(accountId);
   const password = await getAccountPassword(account);
   const deviceProfile = generateRandomDeviceProfile();
-  const databaseProvider = account.source_id ? createDatabaseMailboxProvider(account.source_id) : null;
+
+  // 取码 provider 优先级: mailbox_id > source_id > 无
+  const mailboxProvider = account.mailbox_id ? createMailboxProviderById(account.mailbox_id) : null;
+  const sourceProvider = !mailboxProvider && account.source_id ? createDatabaseMailboxProvider(account.source_id) : null;
+  const emailCodeProvider = mailboxProvider ?? sourceProvider;
+
   if (mode === "auto" && jobId) {
-    addJobEvent(jobId, "info", databaseProvider
-      ? `自动重登: 优先使用邮箱来源 #${account.source_id} 取邮箱验证码`
-      : "自动重登: 账号未配置邮箱来源，将无法处理邮箱验证");
+    if (mailboxProvider) {
+      addJobEvent(jobId, "info", `自动重登: 使用绑定邮箱 #${account.mailbox_id} 取邮箱验证码`);
+    } else if (sourceProvider) {
+      addJobEvent(jobId, "info", `自动重登: 账号未绑定具体邮箱，使用邮箱来源 #${account.source_id} 取码（兜底）`);
+    } else {
+      addJobEvent(jobId, "info", `自动重登: 账号未配置邮箱来源，若需要邮箱验证码将无法自动获取`);
+    }
   }
   const emailOtpProvider = async (targetEmail: string, excludeCodes: string[]) => {
-    if (databaseProvider) {
+    if (emailCodeProvider) {
       try {
-        const code = await databaseProvider.getEmailVerificationCode(targetEmail, {excludeCodes});
+        const code = await emailCodeProvider.getEmailVerificationCode(targetEmail, {excludeCodes});
         logEmailOtpCode(targetEmail, code);
         return code;
       } catch (error) {
@@ -726,7 +739,11 @@ export async function reauthorizeAccount(
   });
   try {
     const result = await client.authLoginHTTP();
-    await importAuthFileFromResult(result.authFile, password);
+    await importAuthFileFromResult(result.authFile, password, {
+      accountId,
+      sourceId: account.source_id,
+      mailboxId: account.mailbox_id,
+    });
     getDb().prepare(`
         UPDATE accounts
         SET status = 'reauthorized',
@@ -790,7 +807,11 @@ export async function manualReauthAccount(
     addJobEvent(jobId, "info", "已收到回调地址，正在交换授权码");
     const result = await client.finalizeManualCallback(callbackUrl.trim());
     const password = await getAccountPassword(account);
-    await importAuthFileFromResult(result.authFile, password);
+    await importAuthFileFromResult(result.authFile, password, {
+      accountId,
+      sourceId: account.source_id,
+      mailboxId: account.mailbox_id,
+    });
     getDb().prepare(`
         UPDATE accounts
         SET status = 'reauthorized',

@@ -46,18 +46,21 @@ async function confirmDelete() {
       const account = props.accounts[0]!;
       const result = await apiSend<{deleted: boolean; platformErrors: Array<{serviceName: string; message: string}>; platformDeleted: Array<{serviceName: string}>}>(`/api/accounts/${account.id}`, "DELETE", {
         deleteFromServiceIds: deleteFromServiceIds.value,
-      });
+      }) as {deleted: boolean; platformErrors: Array<{serviceName: string; message: string}>; platformDeleted: Array<{serviceName: string}>; platformSkipped?: Array<{serviceName: string; message: string}>};
       const errs = result.platformErrors ?? [];
       const ok = result.platformDeleted ?? [];
+      const skipped = result.platformSkipped ?? [];
       if (errs.length) {
         ElMessage.warning(`已删除账号 ${account.email}；平台清理失败：${errs.map((e) => `${e.serviceName}(${e.message})`).join("；")}`);
+      } else if (skipped.length) {
+        ElMessage.warning(`已删除账号 ${account.email}；平台清理跳过：${skipped.map((e) => `${e.serviceName}(${e.message})`).join("；")}`);
       } else if (ok.length) {
         ElMessage.success(`已删除账号 ${account.email}，并清理了 ${ok.length} 个平台`);
       } else {
         ElMessage.success(`已删除账号 ${account.email}`);
       }
     } else {
-      const result = await apiSend<{total: number; deleted: number; failures: Array<{id: number; message: string}>; perAccount: Array<{platformErrors: unknown[]}>}>("/api/accounts/bulk-delete", "POST", {
+      const result = await apiSend<{total: number; deleted: number; failures: Array<{id: number; message: string}>; perAccount: Array<{platformErrors: unknown[]; platformSkipped?: unknown[]}>}>("/api/accounts/bulk-delete", "POST", {
         ids: props.accounts.map((account) => account.id),
         deleteFromServiceIds: deleteFromServiceIds.value,
       });
@@ -65,9 +68,11 @@ async function confirmDelete() {
           ? `；失败 ${result.failures.length} 个：${result.failures.slice(0, 3).map((f) => `#${f.id}(${f.message})`).join("；")}`
           : "";
       const platformErrorCount = (result.perAccount ?? []).reduce((sum, item) => sum + (item.platformErrors?.length ?? 0), 0);
+      const platformSkippedCount = (result.perAccount ?? []).reduce((sum, item) => sum + (item.platformSkipped?.length ?? 0), 0);
       const platformWarn = platformErrorCount ? `；平台清理失败 ${platformErrorCount} 次` : "";
-      if (result.failures?.length || platformErrorCount) {
-        ElMessage.warning(`已删除 ${result.deleted}/${result.total} 个账号${failureMessages}${platformWarn}`);
+      const platformSkipped = platformSkippedCount ? `；平台清理跳过 ${platformSkippedCount} 次` : "";
+      if (result.failures?.length || platformErrorCount || platformSkippedCount) {
+        ElMessage.warning(`已删除 ${result.deleted}/${result.total} 个账号${failureMessages}${platformWarn}${platformSkipped}`);
       } else {
         ElMessage.success(`已删除 ${result.deleted} 个账号`);
       }
