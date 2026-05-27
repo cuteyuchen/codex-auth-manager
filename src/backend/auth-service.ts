@@ -1,12 +1,12 @@
 import {cpus} from "node:os";
-import {mkdir, readdir, readFile, rename, writeFile} from "node:fs/promises";
+import {readdir, readFile} from "node:fs/promises";
 import path from "node:path";
 import {Buffer} from "node:buffer";
 import {fetch as undiciFetch, Agent, ProxyAgent, type Dispatcher, type RequestInit as UndiciRequestInit} from "undici";
 import {appConfig} from "../core/config.js";
 import {AUTH_OAUTH_TOKEN_URLS, DEFAULT_CLIENT_ID, DEFAULT_USER_AGENT} from "../core/constants.js";
 import type {SavedAuthRecord} from "../core/openai.js";
-import {getDb, currentTimestamp, type AccountRow, type AuthFileRow} from "./db.js";
+import {getDb, currentTimestamp, getAuthFileContent, updateAuthFileContent, type AccountRow, type AuthFileRow} from "./db.js";
 import {decryptSecret, encryptSecret} from "./crypto.js";
 import {buildZip, type ZipEntry} from "./zip.js";
 import {
@@ -17,6 +17,7 @@ import {
   deleteAccountFromSub2APIService,
 } from "./integration-service.js";
 import {
+  ensureAccountPlatformBinding,
   listAccountPlatformBindings,
   updateBindingPushResult,
   type BoundPlatformService,
@@ -107,6 +108,7 @@ export interface UpsertAuthOptions {
     preserveSource?: boolean;
     preserveAccountMetadata?: boolean;
     activate?: boolean;
+    contentJson?: string;
 }
 
 const DEFAULT_AUTH_DIR = path.resolve(process.cwd(), "auth");
@@ -154,9 +156,12 @@ export async function loadAuthRecord(filePath: string): Promise<AuthRecord> {
   return JSON.parse(await readFile(filePath, "utf8")) as AuthRecord;
 }
 
-export async function saveAuthRecord(filePath: string, record: AuthRecord): Promise<void> {
-  await mkdir(path.dirname(filePath), {recursive: true});
-  await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+export function loadAuthRecordFromDb(authFile: AuthFileRow): AuthRecord {
+  const content = authFile.content_json ?? getAuthFileContent(authFile.id);
+  if (!content) {
+    throw new Error(`账号凭据内容为空: auth_file_id=${authFile.id}`);
+  }
+  return JSON.parse(content) as AuthRecord;
 }
 
 export function decodeJwtClaims(token: string | undefined): JwtClaims | null {
@@ -452,25 +457,21 @@ async function sendUsageProbe(accessToken: string, accountId: string): Promise<P
 }
 
 async function moveTo401Dir(filePath: string): Promise<boolean> {
-  const parentDir = path.dirname(filePath);
-  const targetDir = path.join(parentDir, "401");
-  const targetPath = path.join(targetDir, path.basename(filePath));
-  await mkdir(targetDir, {recursive: true});
-  await rename(filePath, targetPath);
+  // no-op: auth content is stored in DB, no file to move
   return true;
 }
 
-export async function summarizeAuthFile(filePath: string, forceRefresh: boolean): Promise<AuthSummary> {
-  let record = await loadAuthRecord(filePath);
+export async function summarizeAuthFile(authFileId: number, contentJson: string, forceRefresh: boolean): Promise<AuthSummary> {
+  let record = JSON.parse(contentJson) as AuthRecord;
   const claims = decodeJwtClaims(record.id_token ?? record.access_token);
-  const email = record.email?.trim() || claims?.email?.trim() || path.basename(filePath);
+  const email = record.email?.trim() || claims?.email?.trim() || `auth-file-${authFileId}`;
   const localPlan = claims?.["https://api.openai.com/auth"]?.chatgpt_plan_type?.trim() || "-";
   const credentialType = resolveCredentialType(record);
 
   if (credentialType === "access_token_only") {
     const exp = record.expired?.trim() || String(record.expires_at ?? "").trim();
     return {
-      file: maskPath(filePath),
+      file: `auth-file-${authFileId}`,
       email,
       plan: localPlan,
       status: "access_token_only",
@@ -503,7 +504,7 @@ export async function summarizeAuthFile(filePath: string, forceRefresh: boolean)
       refreshed: false,
     });
     return {
-      file: maskPath(filePath),
+      file: `auth-file-${authFileId}`,
       email,
       plan: localPlan,
       status: "invalid",
@@ -534,7 +535,7 @@ export async function summarizeAuthFile(filePath: string, forceRefresh: boolean)
     if (result.record) {
       record = result.record;
       refreshed = true;
-      await saveAuthRecord(filePath, record);
+      updateAuthFileContent(authFileId, JSON.stringify(record));
       probe = await sendUsageProbe(record.access_token ?? "", record.account_id?.trim() || "");
       message = extractMessage(probe.body);
     } else {
@@ -551,13 +552,13 @@ export async function summarizeAuthFile(filePath: string, forceRefresh: boolean)
 
   if (probe.status === 401) {
     if (shouldMoveTo401(message)) {
-      movedTo401 = await moveTo401Dir(filePath);
+      movedTo401 = true;
     } else {
       const result = await refreshAccessToken(record);
       if (result.record) {
         record = result.record;
         refreshed = true;
-        await saveAuthRecord(filePath, record);
+        updateAuthFileContent(authFileId, JSON.stringify(record));
         probe = await sendUsageProbe(record.access_token ?? "", record.account_id?.trim() || "");
         message = extractMessage(probe.body);
       } else {
@@ -590,7 +591,7 @@ export async function summarizeAuthFile(filePath: string, forceRefresh: boolean)
   });
 
   return {
-    file: maskPath(filePath),
+    file: `auth-file-${authFileId}`,
     email,
     plan,
     status: probe.status === 200 ? "ok" : `http_${probe.status}`,
@@ -619,7 +620,8 @@ export async function importAuthFiles(): Promise<{imported: number; updated: num
 
   for (const filePath of files) {
     try {
-      const record = await loadAuthRecord(filePath);
+      const content = await readFile(filePath, "utf8");
+      const record = JSON.parse(content) as AuthRecord;
       const claims = decodeJwtClaims(record.id_token ?? record.access_token);
       const email = record.email?.trim() || claims?.email?.trim();
       if (!email) {
@@ -628,7 +630,7 @@ export async function importAuthFiles(): Promise<{imported: number; updated: num
       }
 
       const authExists = getDb().prepare("SELECT id FROM auth_files WHERE file_path = ?").get(filePath);
-      await upsertAccountFromAuthRecord(record, filePath);
+      await upsertAccountFromAuthRecord(record, filePath, {contentJson: content});
       if (authExists) {
         updated += 1;
       } else {
@@ -769,6 +771,7 @@ export function upsertAuthFile(accountId: number, filePath: string, record: Auth
   const timestamp = currentTimestamp();
   const credentialType = resolveCredentialType(record);
   const shouldActivate = options.activate !== false;
+  const contentJson = options.contentJson ?? JSON.stringify(record, null, 2);
   if (shouldActivate) {
     getDb().prepare("UPDATE auth_files SET active = 0 WHERE account_id = ? AND file_path <> ?").run(accountId, filePath);
   }
@@ -778,6 +781,7 @@ export function upsertAuthFile(accountId: number, filePath: string, record: Auth
             current_step, step_status, last_step_at,
             credential_source_kind, credential_source_name, credential_source_service_id,
             credential_source_remote_id, credential_synced_at,
+            content_json,
             created_at, updated_at
         )
         VALUES (
@@ -785,6 +789,7 @@ export function upsertAuthFile(accountId: number, filePath: string, record: Auth
             @current_step, @step_status, @last_step_at,
             @credential_source_kind, @credential_source_name, @credential_source_service_id,
             @credential_source_remote_id, @credential_synced_at,
+            @content_json,
             @created_at, @updated_at
         )
         ON CONFLICT(file_path) DO UPDATE SET
@@ -798,6 +803,7 @@ export function upsertAuthFile(accountId: number, filePath: string, record: Auth
             credential_source_service_id = COALESCE(excluded.credential_source_service_id, credential_source_service_id),
             credential_source_remote_id = COALESCE(excluded.credential_source_remote_id, credential_source_remote_id),
             credential_synced_at = COALESCE(excluded.credential_synced_at, credential_synced_at),
+            content_json = excluded.content_json,
             updated_at = excluded.updated_at
     `).run({
     account_id: accountId,
@@ -814,6 +820,7 @@ export function upsertAuthFile(accountId: number, filePath: string, record: Auth
     credential_source_service_id: options.sourceServiceId ?? null,
     credential_source_remote_id: options.sourceRemoteId ?? null,
     credential_synced_at: options.sourceKind ? (options.syncedAt ?? timestamp) : null,
+    content_json: contentJson,
     created_at: timestamp,
     updated_at: timestamp,
   });
@@ -1013,10 +1020,23 @@ export function getActiveAuthFile(accountId: number): AuthFileRow {
         ORDER BY id DESC
         LIMIT 1
     `).get(accountId) as AuthFileRow | undefined;
-  if (!row) {
-    throw new Error(`账号缺少 auth 文件: ${accountId}`);
+  if (row) {
+    return row;
   }
-  return row;
+  // 没有 active 记录时，尝试激活最新的一条
+  const latest = getDb().prepare(`
+        SELECT * FROM auth_files
+        WHERE account_id = ?
+        ORDER BY COALESCE(credential_synced_at, updated_at, created_at) DESC, id DESC
+        LIMIT 1
+    `).get(accountId) as AuthFileRow | undefined;
+  if (!latest) {
+    throw new Error(`账号缺少 auth 文件: ${accountId}，请重新导入 auth 或从平台同步凭据`);
+  }
+  const timestamp = currentTimestamp();
+  getDb().prepare("UPDATE auth_files SET active = 0 WHERE account_id = ?").run(accountId);
+  getDb().prepare("UPDATE auth_files SET active = 1, updated_at = ? WHERE id = ?").run(timestamp, latest.id);
+  return {...latest, active: 1};
 }
 
 export async function setAccountPassword(accountId: number, password: string): Promise<void> {
@@ -1151,13 +1171,13 @@ function updateAccountFromSummary(accountId: number, summary: AuthSummary): void
 
 export async function checkAccount(accountId: number, forceRefresh = false): Promise<AuthSummary> {
   const authFile = getActiveAuthFile(accountId);
-  updateAuthFileStep(accountId, forceRefresh ? "refresh token 刷新中" : "usage 检查中", "running");
-  const summary = await summarizeAuthFile(authFile.file_path, forceRefresh);
-  updateAccountFromSummary(accountId, summary);
-  if (summary.refreshed) {
-    const record = await loadAuthRecord(authFile.file_path);
-    upsertAuthFile(accountId, authFile.file_path, record, {preserveSource: true});
+  const contentJson = authFile.content_json ?? getAuthFileContent(authFile.id);
+  if (!contentJson) {
+    throw new Error(`账号凭据内容为空: ${accountId}`);
   }
+  updateAuthFileStep(accountId, forceRefresh ? "refresh token 刷新中" : "usage 检查中", "running");
+  const summary = await summarizeAuthFile(authFile.id, contentJson, forceRefresh);
+  updateAccountFromSummary(accountId, summary);
   maybeTriggerAutoReauth(accountId, summary);
   return summary;
 }
@@ -1224,12 +1244,33 @@ function assertPushTargetConfigured(target: PushTarget): void {
   }
 }
 
-export async function readAccountAuthFile(accountId: number): Promise<{fileName: string; content: Buffer}> {
+function resolveBindServiceId(kind: "cpa" | "sub2api", serviceId: number | undefined, baseUrl: string): number | null {
+  if (serviceId) {
+    return serviceId;
+  }
+  const normalizedUrl = baseUrl.replace(/\/+$/, "").toLowerCase();
+  const row = getDb().prepare(`
+    SELECT id FROM integration_services
+    WHERE kind = ? AND enabled = 1
+    ORDER BY priority ASC, id ASC
+  `).all(kind) as Array<{id: number; base_url: string}>;
+  for (const r of row) {
+    if (r.base_url.replace(/\/+$/, "").toLowerCase() === normalizedUrl) {
+      return r.id;
+    }
+  }
+  return null;
+}
+
+export function readAccountAuthFile(accountId: number): {fileName: string; content: Buffer} {
   const authFile = getActiveAuthFile(accountId);
-  const content = await readFile(authFile.file_path);
+  const contentJson = authFile.content_json ?? getAuthFileContent(authFile.id);
+  if (!contentJson) {
+    throw new Error(`账号凭据内容为空: ${accountId}`);
+  }
   return {
     fileName: authFile.file_name,
-    content,
+    content: Buffer.from(contentJson, "utf8"),
   };
 }
 
@@ -1348,7 +1389,7 @@ export async function bulkDeleteAccounts(
   return {total: uniqueIds.length, deleted, failures, perAccount};
 }
 
-export async function exportAccountsAuthZip(accountIds: number[]): Promise<{fileName: string; content: Buffer; count: number}> {
+export function exportAccountsAuthZip(accountIds: number[]): {fileName: string; content: Buffer; count: number} {
   const ids = [...new Set(accountIds.map(Number).filter(Number.isFinite))];
   if (!ids.length) {
     throw new Error("请先选择需要导出的账号");
@@ -1357,7 +1398,7 @@ export async function exportAccountsAuthZip(accountIds: number[]): Promise<{file
   const entries: ZipEntry[] = [];
   const usedNames = new Set<string>();
   for (const id of ids) {
-    const auth = await readAccountAuthFile(id);
+    const auth = readAccountAuthFile(id);
     let fileName = auth.fileName;
     let suffix = 2;
     while (usedNames.has(fileName)) {
@@ -1381,7 +1422,11 @@ export async function exportAccountsAuthZip(accountIds: number[]): Promise<{file
 
 export async function pushAccount(accountId: number, target: PushTarget, serviceIds?: number[]): Promise<Record<string, unknown>> {
   const authFile = getActiveAuthFile(accountId);
-  const record = await loadAuthRecord(authFile.file_path) as SavedAuthRecord;
+  const contentJson = authFile.content_json ?? getAuthFileContent(authFile.id);
+  if (!contentJson) {
+    throw new Error(`账号凭据内容为空: ${accountId}`);
+  }
+  const record = JSON.parse(contentJson) as SavedAuthRecord;
   const fileName = authFile.file_name;
   const result: Record<string, unknown> = {};
   const timestamp = currentTimestamp();
@@ -1400,13 +1445,16 @@ export async function pushAccount(accountId: number, target: PushTarget, service
           baseUrl: service.baseUrl,
           managementKey: service.secret,
         }, fileName, record as unknown as Record<string, unknown>);
-        if (service.id) {
-          updateBindingPushResult(accountId, service.id, "success", "CPA 推送成功");
+        const boundId = resolveBindServiceId("cpa", service.id, service.baseUrl);
+        if (boundId) {
+          ensureAccountPlatformBinding(accountId, boundId);
+          updateBindingPushResult(accountId, boundId, "success", "CPA 推送成功");
         }
         serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, status: "success"});
       } catch (error) {
-        if (service.id) {
-          updateBindingPushResult(accountId, service.id, "failed", error instanceof Error ? error.message : String(error));
+        const boundId = resolveBindServiceId("cpa", service.id, service.baseUrl);
+        if (boundId) {
+          updateBindingPushResult(accountId, boundId, "failed", error instanceof Error ? error.message : String(error));
         }
         throw error;
       }
@@ -1433,13 +1481,16 @@ export async function pushAccount(accountId: number, target: PushTarget, service
           adminApiKey: service.secret,
           options: service.options,
         }, fileName, record);
-        if (service.id) {
-          updateBindingPushResult(accountId, service.id, "success", "Sub2API 推送成功");
+        const boundId = resolveBindServiceId("sub2api", service.id, service.baseUrl);
+        if (boundId) {
+          ensureAccountPlatformBinding(accountId, boundId);
+          updateBindingPushResult(accountId, boundId, "success", "Sub2API 推送成功");
         }
         serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, ...uploadResult});
       } catch (error) {
-        if (service.id) {
-          updateBindingPushResult(accountId, service.id, "failed", error instanceof Error ? error.message : String(error));
+        const boundId = resolveBindServiceId("sub2api", service.id, service.baseUrl);
+        if (boundId) {
+          updateBindingPushResult(accountId, boundId, "failed", error instanceof Error ? error.message : String(error));
         }
         throw error;
       }

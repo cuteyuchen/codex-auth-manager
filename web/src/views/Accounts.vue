@@ -48,6 +48,11 @@ const services = ref<IntegrationService[]>([]);
 const selectedServiceIds = ref<number[]>([]);
 const selectedBindingServiceIds = ref<number[]>([]);
 const bindingFilterServiceIds = ref<number[]>([]);
+const rowActionLoading = ref(new Set<number>());
+const bulkActionLoading = ref(false);
+const pushSubmitting = ref(false);
+const bindingSubmitting = ref(false);
+const profileSubmitting = ref(false);
 
 let timer: number | undefined;
 let pendingAutoCheck = false;
@@ -287,6 +292,7 @@ async function single(
     target: "cpa" | "sub2api" | "both" = "both",
     serviceIds?: number[],
 ) {
+  rowActionLoading.value = new Set([...rowActionLoading.value, id]);
   try {
     if (action === "check") {
       await apiSend(`/api/accounts/${id}/check`, "POST");
@@ -301,6 +307,10 @@ async function single(
     await load(true);
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    const next = new Set(rowActionLoading.value);
+    next.delete(id);
+    rowActionLoading.value = next;
   }
 }
 
@@ -313,6 +323,7 @@ async function bulk(
     ElMessage.warning("请先选择账号");
     return;
   }
+  bulkActionLoading.value = true;
   try {
     const result = await apiSend<{ job: { id: number } }>(`/api/accounts/bulk/${action}`, "POST", {
       ids: selectedIds.value,
@@ -323,6 +334,8 @@ async function bulk(
     await router.push("/jobs");
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    bulkActionLoading.value = false;
   }
 }
 
@@ -364,6 +377,7 @@ function openBindings(row?: Account) {
 }
 
 async function confirmBindings() {
+  bindingSubmitting.value = true;
   try {
     if (bindingScope.value === "single") {
       if (!activeAccount.value) {
@@ -386,19 +400,26 @@ async function confirmBindings() {
     await load(true);
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    bindingSubmitting.value = false;
   }
 }
 
 async function confirmPush() {
-  if (pushScope.value === "single") {
-    if (!activeAccount.value) {
-      return;
+  pushSubmitting.value = true;
+  try {
+    if (pushScope.value === "single") {
+      if (!activeAccount.value) {
+        return;
+      }
+      await single(activeAccount.value.id, "push", pushTarget.value, selectedServiceIds.value);
+    } else {
+      await bulk("push", pushTarget.value, selectedServiceIds.value);
     }
-    await single(activeAccount.value.id, "push", pushTarget.value, selectedServiceIds.value);
-  } else {
-    await bulk("push", pushTarget.value, selectedServiceIds.value);
+    pushDialog.value = false;
+  } finally {
+    pushSubmitting.value = false;
   }
-  pushDialog.value = false;
 }
 
 function openProfile(row: Account) {
@@ -426,6 +447,7 @@ async function saveProfile() {
   if (!activeAccount.value) {
     return;
   }
+  profileSubmitting.value = true;
   try {
     const payload: { password?: string; sourceId: number | null } = {
       sourceId: accountSourceId.value,
@@ -441,6 +463,8 @@ async function saveProfile() {
     await load(true);
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    profileSubmitting.value = false;
   }
 }
 
@@ -661,13 +685,13 @@ watch(currentPage, () => {
       </el-form>
       <div class="mt-1 flex flex-wrap items-center justify-between gap-3">
         <div class="flex flex-wrap gap-1.5">
-          <el-button @click="bulk('check')">批量检查</el-button>
-          <el-button @click="bulk('refresh')">批量刷新</el-button>
-          <el-button @click="bulk('reauth')">批量自动重登</el-button>
-          <el-button @click="openPush()">批量推送</el-button>
-          <el-button @click="openBindings()">批量绑定平台</el-button>
-          <el-button @click="downloadAuth(selectedIds)">批量导出</el-button>
-          <el-button type="danger" plain :icon="Delete" @click="openDeleteBulk">批量删除</el-button>
+          <el-button :loading="bulkActionLoading" @click="bulk('check')">批量检查</el-button>
+          <el-button :loading="bulkActionLoading" @click="bulk('refresh')">批量刷新</el-button>
+          <el-button :loading="bulkActionLoading" @click="bulk('reauth')">批量自动重登</el-button>
+          <el-button :loading="bulkActionLoading" @click="openPush()">批量推送</el-button>
+          <el-button :loading="bulkActionLoading" @click="openBindings()">批量绑定平台</el-button>
+          <el-button :loading="bulkActionLoading" @click="downloadAuth(selectedIds)">批量导出</el-button>
+          <el-button type="danger" plain :icon="Delete" :disabled="bulkActionLoading" @click="openDeleteBulk">批量删除</el-button>
         </div>
         <div class="flex items-center gap-2">
           <el-switch v-model="autoPoll" active-text="自动检查当前页" :loading="autoChecking" @change="schedulePoll"/>
@@ -758,8 +782,8 @@ watch(currentPage, () => {
           <el-table-column label="操作" fixed="right" width="260">
             <template #default="{row}">
               <div class="table-actions">
-                <el-button link type="primary" @click="single(row.id, 'check')">检查</el-button>
-                <el-button link type="primary" @click="single(row.id, 'refresh')">刷新</el-button>
+                <el-button link type="primary" :loading="rowActionLoading.has(row.id)" @click="single(row.id, 'check')">检查</el-button>
+                <el-button link type="primary" :loading="rowActionLoading.has(row.id)" @click="single(row.id, 'refresh')">刷新</el-button>
                 <el-dropdown trigger="click" @command="(mode: 'auto' | 'manual') => openReauth(row, mode)">
                   <el-button link :type="row.needs_manual_reauth ? 'danger' : 'warning'">重登
                     <el-icon class="el-icon--right">
@@ -811,7 +835,7 @@ watch(currentPage, () => {
       <div class="text-xs text-[var(--app-muted)]">修改邮箱来源会清空账号绑定的具体邮箱池记录，只保留来源关系。</div>
       <template #footer>
         <el-button @click="profileDialog = false">取消</el-button>
-        <el-button type="primary" @click="saveProfile">保存</el-button>
+        <el-button type="primary" :loading="profileSubmitting" @click="saveProfile">保存</el-button>
       </template>
     </el-dialog>
 
@@ -837,7 +861,7 @@ watch(currentPage, () => {
       </div>
       <template #footer>
         <el-button @click="pushDialog = false">取消</el-button>
-        <el-button type="primary" @click="confirmPush">
+        <el-button type="primary" :loading="pushSubmitting" @click="confirmPush">
           {{ pushScope === "single" ? "推送当前账号" : `推送 ${selectedIds.length} 个账号` }}
         </el-button>
       </template>
@@ -867,7 +891,7 @@ watch(currentPage, () => {
       </el-form>
       <template #footer>
         <el-button @click="bindingDialog = false">取消</el-button>
-        <el-button :icon="Setting" type="primary" @click="confirmBindings">保存绑定</el-button>
+        <el-button :icon="Setting" type="primary" :loading="bindingSubmitting" @click="confirmBindings">保存绑定</el-button>
       </template>
     </el-dialog>
 

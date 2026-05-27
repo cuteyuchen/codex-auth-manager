@@ -217,7 +217,7 @@ app.post("/api/accounts/sync-platforms", async (request) => {
 
 app.get("/api/accounts/:id/auth-file", async (request, reply) => {
   const id = Number((request.params as {id: string}).id);
-  const auth = await readAccountAuthFile(id);
+  const auth = readAccountAuthFile(id);
   return reply
     .type("application/json; charset=utf-8")
     .header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(auth.fileName)}`)

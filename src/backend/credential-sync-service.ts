@@ -1,5 +1,3 @@
-import {mkdir, writeFile} from "node:fs/promises";
-import path from "node:path";
 import type {SavedAuthRecord} from "../core/openai.js";
 import {getDb, currentTimestamp, type IntegrationServiceKind} from "./db.js";
 import {resolvePushServices} from "./integration-service.js";
@@ -37,8 +35,6 @@ export interface CredentialSyncResult {
   checked: number;
   services: CredentialSyncServiceResult[];
 }
-
-const PLATFORM_AUTH_DIR = path.resolve(process.cwd(), "auth", "platforms");
 
 function normalizeServiceIds(ids: number[] | undefined, kind: IntegrationServiceKind): number[] | undefined {
   if (!ids?.length) {
@@ -79,27 +75,6 @@ async function resolveSyncServices(source: CredentialSyncSource, serviceIds?: nu
     throw new Error("部分平台服务不存在或与同步来源不匹配");
   }
   return services.sort((left, right) => (left.priority - right.priority) || ((left.id ?? 999999) - (right.id ?? 999999)));
-}
-
-function safePathSegment(value: string): string {
-  return value.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").slice(0, 120) || "unknown";
-}
-
-async function savePlatformAuthFile(credential: PlatformCredential, existingFilePath?: string): Promise<string> {
-  if (existingFilePath) {
-    await writeFile(existingFilePath, `${JSON.stringify(credential.record, null, 2)}\n`, "utf8");
-    return existingFilePath;
-  }
-  const serviceId = credential.service.id ? String(credential.service.id) : `${credential.service.kind}-fallback`;
-  const directory = path.join(PLATFORM_AUTH_DIR, safePathSegment(serviceId));
-  await mkdir(directory, {recursive: true});
-  const filePath = path.join(directory, safePathSegment(credential.fileName));
-  await writeFile(filePath, `${JSON.stringify(credential.record, null, 2)}\n`, "utf8");
-  return filePath;
-}
-
-function isExistingAuthFile(filePath: string): boolean {
-  return Boolean(getDb().prepare("SELECT id FROM auth_files WHERE file_path = ?").get(filePath));
 }
 
 function writeSyncEvent(input: {
@@ -154,23 +129,28 @@ function findExistingAccountId(record: SavedAuthRecord): number | undefined {
   return row?.id;
 }
 
-function findExistingPlatformAuth(credential: PlatformCredential): {accountId: number; filePath: string} | undefined {
+function findExistingPlatformAuth(credential: PlatformCredential): {accountId: number; authFileId: number; filePath: string} | undefined {
   if (!credential.service.id) {
     return undefined;
   }
   return getDb().prepare(`
-    SELECT account_id AS accountId, file_path AS filePath
+    SELECT account_id AS accountId, id AS authFileId, file_path AS filePath
     FROM auth_files
     WHERE credential_source_service_id = ?
       AND credential_source_remote_id = ?
     ORDER BY id DESC
     LIMIT 1
-  `).get(credential.service.id, credential.remoteId) as {accountId: number; filePath: string} | undefined;
+  `).get(credential.service.id, credential.remoteId) as {accountId: number; authFileId: number; filePath: string} | undefined;
 }
 
 function getAccountEmail(accountId: number): string | undefined {
   const row = getDb().prepare("SELECT email FROM accounts WHERE id = ?").get(accountId) as {email: string} | undefined;
   return row?.email;
+}
+
+function buildPlatformFilePath(credential: PlatformCredential): string {
+  const serviceId = credential.service.id ? String(credential.service.id) : `${credential.service.kind}-fallback`;
+  return `platforms/${serviceId}/${credential.fileName}`;
 }
 
 async function importCredential(credential: PlatformCredential): Promise<{accountId?: number; action: "imported" | "updated" | "skipped"}> {
@@ -180,11 +160,12 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
   const existingPlatformAuth = findExistingPlatformAuth(credential);
   const existingAccountId = findExistingAccountId(credential.record);
   const targetAccountId = existingAccountId ?? existingPlatformAuth?.accountId;
-  const filePath = await savePlatformAuthFile(credential, existingPlatformAuth?.filePath);
+  const filePath = existingPlatformAuth?.filePath ?? buildPlatformFilePath(credential);
+  const contentJson = JSON.stringify(credential.record, null, 2);
   if (targetAccountId) {
     const localEmail = getAccountEmail(targetAccountId);
     const record = localEmail ? {...credential.record, email: localEmail} : credential.record;
-    await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    const finalContentJson = localEmail ? JSON.stringify(record, null, 2) : contentJson;
     upsertAuthFile(targetAccountId, filePath, record, {
       sourceKind: credential.service.kind,
       sourceName: credential.service.name,
@@ -192,6 +173,7 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
       sourceRemoteId: credential.remoteId,
       syncedAt: currentTimestamp(),
       activate: false,
+      contentJson: finalContentJson,
     });
     if (credential.service.id) {
       ensureAccountPlatformBinding(targetAccountId, credential.service.id);
@@ -207,6 +189,7 @@ async function importCredential(credential: PlatformCredential): Promise<{accoun
     syncedAt: currentTimestamp(),
     preserveAccountMetadata: true,
     activate: false,
+    contentJson,
   });
   if (credential.service.id) {
     ensureAccountPlatformBinding(account.id, credential.service.id);

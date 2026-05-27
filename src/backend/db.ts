@@ -1,4 +1,4 @@
-import {copyFileSync, existsSync, mkdirSync, statSync} from "node:fs";
+import {copyFileSync, existsSync, mkdirSync, readFileSync, statSync} from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 
@@ -58,6 +58,7 @@ export interface AuthFileRow {
     credential_source_service_id?: number | null;
     credential_source_remote_id?: string | null;
     credential_synced_at?: string | null;
+    content_json?: string | null;
 }
 
 export interface AccountUsageWindowRow {
@@ -313,6 +314,7 @@ function migrate(database: Database.Database): void {
   addColumnIfMissing(database, "auth_files", "credential_source_service_id", "INTEGER");
   addColumnIfMissing(database, "auth_files", "credential_source_remote_id", "TEXT");
   addColumnIfMissing(database, "auth_files", "credential_synced_at", "TEXT");
+  addColumnIfMissing(database, "auth_files", "content_json", "TEXT");
 
   database.exec(`
         CREATE TABLE IF NOT EXISTS mail_types (
@@ -446,6 +448,7 @@ function migrate(database: Database.Database): void {
     `);
 
   backfillPlatformBindings(database);
+  migrateAuthFileContentToDb(database);
 
   addColumnIfMissing(database, "mail_sources", "mail_type_id", "INTEGER REFERENCES mail_types(id) ON DELETE SET NULL");
   addColumnIfMissing(database, "mail_sources", "vendor", "TEXT");
@@ -557,6 +560,33 @@ function backfillPlatformBindings(database: Database.Database): void {
   `).run({timestamp});
 }
 
+function migrateAuthFileContentToDb(database: Database.Database): void {
+  const rows = database.prepare(
+    "SELECT id, file_path FROM auth_files WHERE content_json IS NULL OR content_json = ''",
+  ).all() as Array<{id: number; file_path: string}>;
+  if (!rows.length) {
+    return;
+  }
+  const update = database.prepare("UPDATE auth_files SET content_json = ?, updated_at = ? WHERE id = ?");
+  const timestamp = now();
+  let migrated = 0;
+  for (const row of rows) {
+    try {
+      if (existsSync(row.file_path)) {
+        const content = readFileSync(row.file_path, "utf8");
+        JSON.parse(content);
+        update.run(content, timestamp, row.id);
+        migrated += 1;
+      }
+    } catch {
+      // skip unreadable / invalid files
+    }
+  }
+  if (migrated > 0 || rows.length > 0) {
+    console.log(`[migration] auth_files content_json: ${migrated}/${rows.length} migrated from disk`);
+  }
+}
+
 export function upsertSetting(key: string, value: string): void {
   getDb().prepare(`
         INSERT INTO settings_meta (key, value, updated_at)
@@ -574,6 +604,15 @@ export function getSettings(): Record<string, string> {
 
 export function currentTimestamp(): string {
   return now();
+}
+
+export function getAuthFileContent(authFileId: number): string | null {
+  const row = getDb().prepare("SELECT content_json FROM auth_files WHERE id = ?").get(authFileId) as {content_json: string | null} | undefined;
+  return row?.content_json ?? null;
+}
+
+export function updateAuthFileContent(authFileId: number, content: string): void {
+  getDb().prepare("UPDATE auth_files SET content_json = ?, updated_at = ? WHERE id = ?").run(content, now(), authFileId);
 }
 
 export function getDatabaseStats(): {
