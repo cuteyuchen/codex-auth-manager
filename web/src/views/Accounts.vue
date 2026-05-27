@@ -276,21 +276,6 @@ async function singleCheck(id: number) {
   }
 }
 
-async function singleRepair(id: number) {
-  rowActionLoading.value = new Set([...rowActionLoading.value, id]);
-  try {
-    const result = await apiSend<{job: {id: number}}>(`/api/accounts/${id}/check`, "POST", {repair: true});
-    ElMessage.success(`修复任务已创建 #${result.job.id}`);
-    await router.push("/jobs");
-  } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : String(error));
-  } finally {
-    const next = new Set(rowActionLoading.value);
-    next.delete(id);
-    rowActionLoading.value = next;
-  }
-}
-
 async function singleRefresh(id: number) {
   rowActionLoading.value = new Set([...rowActionLoading.value, id]);
   try {
@@ -321,7 +306,7 @@ async function singlePush(id: number, target: "cpa" | "sub2api" | "both" = "both
   }
 }
 
-async function bulk(action: "check" | "refresh" | "reauth" | "push" | "repair", target: "cpa" | "sub2api" | "both" = "both", serviceIds?: number[]) {
+async function bulk(action: "check" | "refresh" | "reauth" | "push", target: "cpa" | "sub2api" | "both" = "both", serviceIds?: number[]) {
   if (!selectedIds.value.length) {
     ElMessage.warning("请先选择账号");
     return;
@@ -575,7 +560,6 @@ watch(currentPage, () => {
       <div class="mt-1 flex flex-wrap items-center justify-between gap-3">
         <BulkActionsBar :loading="bulkActionLoading" :selected-count="selectedIds.length"
                         @check="bulk('check')"
-                        @repair="bulk('repair')"
                         @refresh="bulk('refresh')"
                         @reauth="bulk('reauth')"
                         @push="openPush()"
@@ -631,7 +615,6 @@ watch(currentPage, () => {
             <template #default="{row}">
               <RowActions :row="row" :loading="rowActionLoading.has(row.id)"
                           @check="singleCheck"
-                          @repair="singleRepair"
                           @refresh="singleRefresh"
                           @reauth="(r, m) => openReauth(r, m)"
                           @push="(r) => openPush(r)"

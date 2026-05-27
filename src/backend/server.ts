@@ -74,7 +74,6 @@ import {
   type BindingMode,
 } from "./account-platform-binding-service.js";
 import {syncPlatformCredentials, type CredentialSyncSource} from "./credential-sync-service.js";
-import {repairAccount, bulkRepairAccounts} from "./account-lifecycle-service.js";
 import {backupDatabase, cleanupJobs, getSystemDatabaseInfo} from "./system-service.js";
 import {
   assertHostAccessAllowed,
@@ -259,15 +258,6 @@ app.put("/api/accounts/:id/profile", async (request) => {
 
 app.post("/api/accounts/:id/check", async (request) => {
   const id = Number((request.params as {id: string}).id);
-  const body = request.body as {refresh?: boolean; repair?: boolean} | undefined;
-  if (body?.repair) {
-    const job = createJob("repair", `修复检查 ${id}`, {id, mode: "repair"});
-    void runJob(job.id, async () => {
-      const result = await repairAccount(id, job.id);
-      return result as unknown as Record<string, unknown>;
-    }, {exclusiveRegister: true});
-    return {job};
-  }
   // 普通 check：只读，不触发 refresh / 自动重登 / 回推
   // explicit refresh 走 POST /api/accounts/:id/refresh
   return checkAccount(id, {forceRefresh: false, triggerAutoReauth: false});
@@ -348,10 +338,6 @@ app.post("/api/accounts/bulk/:action", async (request) => {
   const job = createJob(`bulk_${action}`, `批量${action}`, {ids, target: body?.target});
   void runJob(job.id, async () => {
     const concurrency = resolveDefaultConcurrency(ids.length);
-    if (action === "repair") {
-      const result = await bulkRepairAccounts({ids, jobId: job.id});
-      return result as unknown as Record<string, unknown>;
-    }
     const results = await mapWithConcurrency(ids, concurrency, async (id) => {
       if (action === "check") {
         return {id, result: await checkAccount(id, {forceRefresh: false, triggerAutoReauth: false})};

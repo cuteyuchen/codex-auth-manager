@@ -60,7 +60,13 @@ interface Sub2APIImportResult {
   updated?: number;
   skipped?: number;
   failed?: number;
-  items?: Array<{action?: string; message?: string}>;
+  items?: Array<{
+    action?: string;
+    account_id?: number | string;
+    id?: number | string;
+    name?: string;
+    message?: string;
+  }>;
   errors?: Array<{message?: string}>;
 }
 
@@ -69,6 +75,7 @@ export interface Sub2APIUploadResult {
   updated: number;
   skipped: number;
   failed: number;
+  accountIds: number[];
 }
 
 function normalizeKind(value: unknown): IntegrationServiceKind {
@@ -458,6 +465,25 @@ function summarizeImportErrors(result: Sub2APIImportResult): string {
   return messages.length ? ` errors=${messages.join("; ")}` : "";
 }
 
+function normalizeSub2APIAccountId(value: unknown): number | null {
+  const id = Number(value);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+function collectSub2APIAccountIds(result: Sub2APIImportResult): number[] {
+  const ids = new Set<number>();
+  for (const item of result.items ?? []) {
+    if (item.action === "failed" || item.action === "skipped") {
+      continue;
+    }
+    const id = normalizeSub2APIAccountId(item.account_id ?? item.id);
+    if (id) {
+      ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
 export async function uploadAuthFileToSub2APIService(
   config: Sub2APIConfig,
   fileName: string,
@@ -482,11 +508,33 @@ export async function uploadAuthFileToSub2APIService(
     updated: Number(result.updated ?? 0),
     skipped: Number(result.skipped ?? 0),
     failed: Number(result.failed ?? 0),
+    accountIds: collectSub2APIAccountIds(result),
   };
   if (uploadResult.failed > 0) {
     throw new Error(`Sub2API 导入失败: failed=${uploadResult.failed}${summarizeImportErrors(result)}`);
   }
   return uploadResult;
+}
+
+export async function recoverSub2APIAccountStateService(
+  config: Sub2APIConfig,
+  remoteId: number | string,
+): Promise<void> {
+  const id = String(remoteId).trim();
+  if (!id) {
+    throw new Error("Sub2API 恢复账号状态缺少 remoteId");
+  }
+  const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/api/v1/admin/accounts/${encodeURIComponent(id)}/recover-state`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "x-api-key": config.adminApiKey,
+    },
+  });
+  const rawBody = await response.text();
+  if (!response.ok) {
+    throw new Error(`Sub2API 恢复账号状态失败: ${response.status} body=${rawBody.slice(0, 200)}`);
+  }
 }
 
 export async function deleteAccountFromSub2APIService(

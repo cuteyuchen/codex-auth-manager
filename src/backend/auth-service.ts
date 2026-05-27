@@ -14,6 +14,7 @@ import {
   saveAuthFileJsonObjectToCPAService,
   deleteAuthFileFromCPAService,
   uploadAuthFileToSub2APIService,
+  recoverSub2APIAccountStateService,
   deleteAccountFromSub2APIService,
 } from "./integration-service.js";
 import {
@@ -1284,6 +1285,100 @@ function resolveBindServiceId(kind: "cpa" | "sub2api", serviceId: number | undef
   return null;
 }
 
+function resolveKnownSub2APIRemoteIds(accountId: number, serviceId: number | undefined): number[] {
+  if (!serviceId) {
+    return [];
+  }
+  const rows = getDb().prepare(`
+    SELECT credential_source_remote_id AS remoteId
+    FROM auth_files
+    WHERE account_id = ?
+      AND credential_source_kind = 'sub2api'
+      AND credential_source_service_id = ?
+      AND credential_source_remote_id IS NOT NULL
+    UNION
+    SELECT credential_source_remote_id AS remoteId
+    FROM accounts
+    WHERE id = ?
+      AND credential_source_kind = 'sub2api'
+      AND credential_source_service_id = ?
+      AND credential_source_remote_id IS NOT NULL
+  `).all(accountId, serviceId, accountId, serviceId) as Array<{remoteId: string | null}>;
+  const ids = new Set<number>();
+  for (const row of rows) {
+    const id = Number(String(row.remoteId ?? "").trim());
+    if (Number.isFinite(id) && id > 0) {
+      ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
+function rememberSub2APIRemoteId(accountId: number, authFileId: number, serviceId: number | undefined, remoteId: number | null): void {
+  if (!serviceId || !remoteId) {
+    return;
+  }
+  const timestamp = currentTimestamp();
+  getDb().prepare(`
+    UPDATE auth_files
+    SET credential_source_kind = 'sub2api',
+        credential_source_service_id = @service_id,
+        credential_source_remote_id = @remote_id,
+        credential_synced_at = @synced_at,
+        updated_at = @updated_at
+    WHERE id = @auth_file_id
+  `).run({
+    auth_file_id: authFileId,
+    service_id: serviceId,
+    remote_id: String(remoteId),
+    synced_at: timestamp,
+    updated_at: timestamp,
+  });
+  getDb().prepare(`
+    UPDATE accounts
+    SET credential_source_kind = 'sub2api',
+        credential_source_service_id = @service_id,
+        credential_source_remote_id = @remote_id,
+        credential_synced_at = @synced_at,
+        updated_at = @updated_at
+    WHERE id = @account_id
+  `).run({
+    account_id: accountId,
+    service_id: serviceId,
+    remote_id: String(remoteId),
+    synced_at: timestamp,
+    updated_at: timestamp,
+  });
+}
+
+async function recoverSub2APIAccountStatesAfterPush(
+  accountId: number,
+  service: {id?: number; baseUrl: string; secret: string; options: Record<string, unknown>},
+  accountIds: number[],
+): Promise<{recovered: number[]; failed: Array<{accountId: number; error: string}>}> {
+  const ids = [...new Set([
+    ...accountIds,
+    ...resolveKnownSub2APIRemoteIds(accountId, service.id),
+  ])];
+  const recovered: number[] = [];
+  const failed: Array<{accountId: number; error: string}> = [];
+  for (const remoteId of ids) {
+    try {
+      await recoverSub2APIAccountStateService({
+        baseUrl: service.baseUrl,
+        adminApiKey: service.secret,
+        options: service.options,
+      }, remoteId);
+      recovered.push(remoteId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failed.push({accountId: remoteId, error: message});
+      console.warn(`sub2apiRecoverStateFailed: account=${accountId} remote=${remoteId} error=${message}`);
+    }
+  }
+  return {recovered, failed};
+}
+
 export function readAccountAuthFile(accountId: number): {fileName: string; content: Buffer} {
   const authFile = getActiveAuthFile(accountId);
   const contentJson = authFile.content_json ?? getAuthFileContent(authFile.id);
@@ -1560,12 +1655,28 @@ export async function pushAccount(accountId: number, target: PushTarget, service
           adminApiKey: service.secret,
           options: service.options,
         }, fileName, record);
+        if (uploadResult.accountIds.length) {
+          rememberSub2APIRemoteId(accountId, authFile.id, service.id, uploadResult.accountIds[0] ?? null);
+        }
+        const recovery = await recoverSub2APIAccountStatesAfterPush(accountId, service, uploadResult.accountIds);
         const boundId = resolveBindServiceId("sub2api", service.id, service.baseUrl);
         if (boundId) {
           ensureAccountPlatformBinding(accountId, boundId);
-          updateBindingPushResult(accountId, boundId, "success", "Sub2API 推送成功");
+          const message = recovery.failed.length
+            ? `Sub2API 推送成功；状态恢复失败: ${recovery.failed.map((item) => `${item.accountId} ${item.error}`).join("; ")}`
+            : recovery.recovered.length
+              ? `Sub2API 推送成功；已恢复状态: ${recovery.recovered.join(", ")}`
+              : "Sub2API 推送成功；未返回远端 ID，跳过状态恢复";
+          updateBindingPushResult(accountId, boundId, recovery.failed.length || !recovery.recovered.length ? "failed" : "success", message);
         }
-        serviceResults.push({id: service.id, name: service.name, fallback: service.fallback, ...uploadResult});
+        serviceResults.push({
+          id: service.id,
+          name: service.name,
+          fallback: service.fallback,
+          ...uploadResult,
+          recovered: recovery.recovered,
+          recoverFailed: recovery.failed,
+        });
       } catch (error) {
         const boundId = resolveBindServiceId("sub2api", service.id, service.baseUrl);
         if (boundId) {

@@ -8,7 +8,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: "check", id: number): void;
-  (event: "repair", id: number): void;
   (event: "refresh", id: number): void;
   (event: "reauth", row: Account, mode: "auto" | "manual"): void;
   (event: "push", row: Account): void;
@@ -23,7 +22,6 @@ const emit = defineEmits<{
 <template>
   <div class="flex flex-wrap gap-x-1 gap-y-0.5">
     <el-button link type="primary" :loading="loading" @click="emit('check', row.id)">检查</el-button>
-    <el-button link type="success" :loading="loading" @click="emit('repair', row.id)">修复</el-button>
     <el-button link type="primary" :loading="loading" @click="emit('refresh', row.id)">刷新</el-button>
     <el-dropdown trigger="click" @command="(mode: 'auto' | 'manual') => emit('reauth', row, mode)">
       <el-button link :type="row.needs_manual_reauth ? 'danger' : 'warning'">重登
