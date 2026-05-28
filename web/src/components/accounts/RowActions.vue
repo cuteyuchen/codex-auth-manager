@@ -24,9 +24,7 @@ const emit = defineEmits<{
     <el-button link type="primary" :loading="loading" @click="emit('check', row.id)">检查</el-button>
     <el-button link type="primary" :loading="loading" @click="emit('refresh', row.id)">刷新</el-button>
     <el-dropdown trigger="click" @command="(mode: 'auto' | 'manual') => emit('reauth', row, mode)">
-      <el-button link :type="row.needs_manual_reauth ? 'danger' : 'warning'">重登
-        <el-icon class="el-icon--right"><i-ep-arrow-down/></el-icon>
-      </el-button>
+      <el-button link :type="row.needs_manual_reauth ? 'danger' : 'warning'">重登</el-button>
       <template #dropdown>
         <el-dropdown-menu>
           <el-dropdown-item command="auto">自动重登（密码 + 邮箱验证码）</el-dropdown-item>
@@ -42,9 +40,7 @@ const emit = defineEmits<{
       else if (cmd === 'export') emit('export', row.id);
       else if (cmd === 'delete') emit('delete', row);
     }">
-      <el-button link type="info">更多
-        <el-icon class="el-icon--right"><i-ep-arrow-down/></el-icon>
-      </el-button>
+      <el-button link type="info">更多</el-button>
       <template #dropdown>
         <el-dropdown-menu>
           <el-dropdown-item command="push">推送</el-dropdown-item>

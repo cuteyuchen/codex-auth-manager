@@ -23,6 +23,7 @@ import {
 } from "./auth-service.js";
 import {getSchedulerConfig, startScheduler, updateSchedulerConfig} from "./scheduler.js";
 import {
+  addJobEvent,
   createJob,
   cancelJob,
   getJob,
@@ -337,7 +338,7 @@ app.post("/api/accounts/bulk/:action", async (request) => {
   const ids = Array.isArray(body?.ids) ? body.ids.map(Number).filter(Number.isFinite) : [];
   const job = createJob(`bulk_${action}`, `批量${action}`, {ids, target: body?.target});
   void runJob(job.id, async () => {
-    const concurrency = resolveDefaultConcurrency(ids.length);
+    const concurrency = action === "reauth" ? 1 : resolveDefaultConcurrency(ids.length);
     const results = await mapWithConcurrency(ids, concurrency, async (id) => {
       if (action === "check") {
         return {id, result: await checkAccount(id, {forceRefresh: false, triggerAutoReauth: false})};
@@ -346,12 +347,21 @@ app.post("/api/accounts/bulk/:action", async (request) => {
         return {id, result: await checkAccount(id, {forceRefresh: true, triggerAutoReauth: false})};
       }
       if (action === "reauth") {
-        const result = await reauthorizeAccount(id, job.id);
         try {
-          await pushAccountToBoundPlatforms(id);
-          return {id, result: {...result, boundPlatformPush: "success"}};
+          const result = await reauthorizeAccount(id, job.id);
+          try {
+            await pushAccountToBoundPlatforms(id);
+          } catch (pushError) {
+            addJobEvent(job.id, "warn", `推送绑定平台失败: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
+          }
+          try {
+            const summary = await checkAccount(id, {forceRefresh: true, triggerAutoReauth: false});
+            return {id, result: {...result, boundPlatformPush: "success", check: summary}};
+          } catch (checkError) {
+            return {id, result: {...result, boundPlatformPush: "success", checkError: checkError instanceof Error ? checkError.message : String(checkError)}};
+          }
         } catch (error) {
-          return {id, result: {...result, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)}};
+          return {id, error: error instanceof Error ? error.message : String(error)};
         }
       }
       if (action === "push") {

@@ -332,12 +332,16 @@ async function runSingleRegistrationInner(options: RegisterOptions, email?: stri
         throw new Error(`验证码已使用过: ${code}`);
       }
       logEmailOtpCode(targetEmail, code);
+      addJobEvent(options.jobId as number, "info", `邮箱验证码: ${targetEmail} code=${code}`);
       return code;
     }
     : databaseProvider
       ? async (targetEmail: string, excludeCodes: string[]) => {
         const code = await databaseProvider.getEmailVerificationCode(targetEmail, {excludeCodes});
         logEmailOtpCode(targetEmail, code);
+        if (options.jobId) {
+          addJobEvent(options.jobId, "info", `邮箱验证码: ${targetEmail} code=${code}`);
+        }
         return code;
       }
       : undefined;
@@ -351,6 +355,10 @@ async function runSingleRegistrationInner(options: RegisterOptions, email?: stri
     email = await emailAddressProvider();
   }
   email = normalizeEmailAddress(email);
+  if (options.jobId) {
+    addJobEvent(options.jobId, "info", `注册邮箱: ${email}`);
+    addJobEvent(options.jobId, "info", `注册密码: ${password}`);
+  }
   if (options.authOnly) {
     throwIfJobCancelled(options.jobId);
     if (!email) {
@@ -689,8 +697,14 @@ export async function reauthorizeAccount(
   const emailCodeProvider = mailboxProvider ?? sourceProvider;
 
   if (mode === "auto" && jobId) {
+    addJobEvent(jobId, "info", `自动重登: 邮箱=${account.email} 密码=${password || "(未保存)"}`);
     if (mailboxProvider) {
-      addJobEvent(jobId, "info", `自动重登: 使用绑定邮箱 #${account.mailbox_id} 取邮箱验证码`);
+      try {
+        const mailboxEmail = await mailboxProvider.getEmailAddress();
+        addJobEvent(jobId, "info", `自动重登: 使用绑定邮箱 ${mailboxEmail} 取邮箱验证码`);
+      } catch {
+        addJobEvent(jobId, "info", `自动重登: 使用绑定邮箱 #${account.mailbox_id} 取邮箱验证码`);
+      }
     } else if (sourceProvider) {
       addJobEvent(jobId, "info", `自动重登: 账号未绑定具体邮箱，使用邮箱来源 #${account.source_id} 取码（兜底）`);
     } else {
@@ -702,6 +716,9 @@ export async function reauthorizeAccount(
       try {
         const code = await emailCodeProvider.getEmailVerificationCode(targetEmail, {excludeCodes});
         logEmailOtpCode(targetEmail, code);
+        if (jobId) {
+          addJobEvent(jobId, "info", `邮箱验证码: ${targetEmail} code=${code}`);
+        }
         return code;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -721,6 +738,9 @@ export async function reauthorizeAccount(
       throw new Error(`验证码已使用过: ${code}`);
     }
     logEmailOtpCode(targetEmail, code);
+    if (jobId) {
+      addJobEvent(jobId, "info", `邮箱验证码: ${targetEmail} code=${code}`);
+    }
     return code;
   };
   const client = new OpenAIClient({
@@ -768,6 +788,17 @@ export async function reauthorizeAccount(
       throw error;
     }
     const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("account_deactivated")) {
+      getDb().prepare(`
+        UPDATE accounts SET status = 'deactivated', status_code = 'account_deactivated',
+          status_label = '账号已被封禁', last_error = @last_error, updated_at = @updated_at
+        WHERE id = @id
+      `).run({id: accountId, last_error: message, updated_at: currentTimestamp()});
+      if (jobId) {
+        addJobEvent(jobId, "error", `账号已被封禁: ${account.email}`);
+      }
+      throw error;
+    }
     if (mode === "auto") {
       setNeedsManualReauth(accountId, message);
       if (jobId) {

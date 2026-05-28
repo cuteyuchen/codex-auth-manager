@@ -230,6 +230,13 @@ export interface OpenAIClientOptions {
     shouldCancel?: () => boolean;
 }
 
+export class IdentityProviderMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IdentityProviderMismatchError";
+  }
+}
+
 export class OpenAIClient {
   email: string;
   readonly password: string;
@@ -419,7 +426,21 @@ export class OpenAIClient {
     if (continueURL === `${AUTH_BASE_URL}/about-you`) {
       totalSteps += 1;
       this.logProgress(step++, totalSteps, "填写基础资料");
-      continueURL = await this.completeAboutYou();
+      const MAX_MISMATCH_RETRIES = 2;
+      for (let mismatchAttempt = 0; ; mismatchAttempt++) {
+        try {
+          continueURL = await this.completeAboutYou();
+          break;
+        } catch (error) {
+          if (error instanceof IdentityProviderMismatchError && mismatchAttempt < MAX_MISMATCH_RETRIES && this.smsBroker) {
+            console.warn(`[SMS] 号码身份不匹配，废弃当前号码并换号重试 (${mismatchAttempt + 1}/${MAX_MISMATCH_RETRIES})`);
+            this.smsBroker.discardCurrentActivation();
+            continueURL = await this.runSmsVerification();
+          } else {
+            throw error;
+          }
+        }
+      }
     }
 
     if (continueURL.startsWith(`${CHATGPT_BASE_URL}/api/auth/callback/openai`)) {
@@ -485,7 +506,21 @@ export class OpenAIClient {
     if (continueURL === `${AUTH_BASE_URL}/about-you`) {
       totalSteps += 1;
       this.logProgress(step++, totalSteps, "填写基础资料");
-      continueURL = await this.completeAboutYou();
+      const MAX_MISMATCH_RETRIES = 2;
+      for (let mismatchAttempt = 0; ; mismatchAttempt++) {
+        try {
+          continueURL = await this.completeAboutYou();
+          break;
+        } catch (error) {
+          if (error instanceof IdentityProviderMismatchError && mismatchAttempt < MAX_MISMATCH_RETRIES && this.smsBroker) {
+            console.warn(`[SMS] 号码身份不匹配，废弃当前号码并换号重试 (${mismatchAttempt + 1}/${MAX_MISMATCH_RETRIES})`);
+            this.smsBroker.discardCurrentActivation();
+            continueURL = await this.runSmsVerification();
+          } else {
+            throw error;
+          }
+        }
+      }
     }
 
     if (continueURL === `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`) {
@@ -628,6 +663,9 @@ export class OpenAIClient {
       }
 
       lastError = await this.formatErrorResponse(response);
+      if (lastError.includes("account_deactivated")) {
+        throw new Error(`EmailOtpValidate请求失败: ${lastError}`);
+      }
       console.warn(
         `EmailOtpValidate请求失败(${attempt}/${EMAIL_OTP_SUBMIT_ATTEMPTS}) code=${code}: ${lastError}`,
       );
@@ -1020,9 +1058,13 @@ export class OpenAIClient {
       },
     );
     if (!response.ok) {
-      throw new Error(
-        `CreateAccount请求失败: ${await this.formatErrorResponse(response)}`,
-      );
+      const body = await response.text();
+      if (body.includes("identity_provider_mismatch")) {
+        throw new IdentityProviderMismatchError(
+          `CreateAccount identity_provider_mismatch: ${body}`,
+        );
+      }
+      throw new Error(`CreateAccount请求失败: ${response.status} ${body}`);
     }
     const payload = (await response.json()) as ContinueResponse;
     return payload.page?.payload?.url ?? payload.continue_url;
@@ -1471,18 +1513,29 @@ export class OpenAIClient {
     authorizeUrl.searchParams.set("screen_hint", this.signupScreenHint);
     authorizeUrl.searchParams.set("login_hint", email);
 
-    const response = await this.fetch(authorizeUrl.toString(), {
-      method: "GET",
-      redirect: "follow",
-      headers: this.createBrowserHeaders({
-        "accept-encoding": "gzip, deflate, br",
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "none",
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(`打开直接注册授权页失败: ${response.status}`);
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      this.throwIfCancelled();
+      const response = await this.fetch(authorizeUrl.toString(), {
+        method: "GET",
+        redirect: "follow",
+        headers: this.createBrowserHeaders({
+          "accept-encoding": "gzip, deflate, br",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+        }),
+      });
+      if (response.status === 429 && attempt < MAX_RETRIES) {
+        const delay = Math.min(5000 * (attempt + 1), 15000);
+        console.warn(`[注册] 打开直接注册授权页遇到 429，${delay / 1000}s 后重试 (${attempt + 1}/${MAX_RETRIES})`);
+        await sleep(delay, this.shouldCancel);
+        continue;
+      }
+      if (!response.ok) {
+        throw new Error(`打开直接注册授权页失败: ${response.status}`);
+      }
+      break;
     }
 
     this.deviceID = await this.readCookie("https://openai.com", "oai-did");

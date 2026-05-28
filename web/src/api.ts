@@ -87,6 +87,7 @@ export interface Account {
     current_step: string | null;
     step_status: string | null;
     last_step_at: string | null;
+    token_expires_at: string | null;
     usage_windows: UsageWindow[];
     platform_bindings: BoundPlatformService[];
 }

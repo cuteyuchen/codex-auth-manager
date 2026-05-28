@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import {computed, onBeforeUnmount, onMounted, reactive, ref, watch} from "vue";
-import {useRouter} from "vue-router";
 import {ElMessage} from "element-plus";
 import {Delete, Download, Refresh, Setting} from "@element-plus/icons-vue";
 import {
@@ -9,7 +8,7 @@ import {
   type Account,
   type BoundPlatformService,
   type IntegrationService,
-  type MailSource,
+  type Job,
 } from "../api";
 import ReauthDialog from "../components/ReauthDialog.vue";
 import SyncDialog from "../components/SyncDialog.vue";
@@ -22,12 +21,11 @@ import PlatformBindingsCell from "../components/accounts/PlatformBindingsCell.vu
 import StepCell from "../components/accounts/StepCell.vue";
 import RowActions from "../components/accounts/RowActions.vue";
 import BulkActionsBar from "../components/accounts/BulkActionsBar.vue";
+import BulkProgressDialog from "../components/accounts/BulkProgressDialog.vue";
 import FilterBar from "../components/accounts/FilterBar.vue";
 
-const router = useRouter();
 const accounts = ref<Account[]>([]);
 const selected = ref<Account[]>([]);
-const mailSources = ref<MailSource[]>([]);
 const loading = ref(false);
 const autoChecking = ref(false);
 const autoPoll = ref(true);
@@ -47,7 +45,6 @@ const deleteTargets = ref<Account[]>([]);
 const activeAccount = ref<Account | null>(null);
 const passwordValue = ref("");
 const clearPassword = ref(false);
-const accountSourceId = ref<number | null>(null);
 const pushTarget = ref<"cpa" | "sub2api" | "both">("cpa");
 const pushScope = ref<"single" | "bulk">("single");
 const bindingScope = ref<"single" | "bulk">("single");
@@ -58,6 +55,8 @@ const selectedBindingServiceIds = ref<number[]>([]);
 const bindingFilterServiceIds = ref<number[]>([]);
 const rowActionLoading = ref(new Set<number>());
 const bulkActionLoading = ref(false);
+const bulkJob = ref<Job | null>(null);
+const bulkProgressVisible = ref(false);
 const pushSubmitting = ref(false);
 const bindingSubmitting = ref(false);
 const profileSubmitting = ref(false);
@@ -162,15 +161,6 @@ async function loadServices() {
     services.value = payload.services;
   } catch {
     services.value = [];
-  }
-}
-
-async function loadMailSources() {
-  try {
-    const payload = await apiGet<{ sources: MailSource[] }>("/api/mail-sources");
-    mailSources.value = payload.sources;
-  } catch {
-    mailSources.value = [];
   }
 }
 
@@ -318,8 +308,8 @@ async function bulk(action: "check" | "refresh" | "reauth" | "push", target: "cp
       target,
       serviceIds,
     });
-    ElMessage.success(`已创建批量任务 #${result.job.id}`);
-    await router.push("/jobs");
+    bulkJob.value = result.job as Job;
+    bulkProgressVisible.value = true;
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
@@ -410,9 +400,7 @@ function openProfile(row: Account) {
   activeAccount.value = row;
   passwordValue.value = "";
   clearPassword.value = false;
-  accountSourceId.value = row.source_id ?? null;
   profileDialog.value = true;
-  void loadMailSources();
   if (row.has_password) {
     void (async () => {
       try {
@@ -431,7 +419,7 @@ async function saveProfile() {
   if (!activeAccount.value) return;
   profileSubmitting.value = true;
   try {
-    const payload: {password?: string; sourceId: number | null} = {sourceId: accountSourceId.value};
+    const payload: {password?: string} = {};
     if (clearPassword.value) {
       payload.password = "";
     } else if (passwordValue.value) {
@@ -485,6 +473,10 @@ function onDeleted() {
   void load(true);
 }
 
+function onBulkFinished() {
+  void load(true);
+}
+
 function formatDate(value: string | null | undefined) {
   if (!value) return "-";
   return new Date(value).toLocaleString();
@@ -511,7 +503,7 @@ function schedulePoll() {
 
 onMounted(async () => {
   await load(true);
-  await Promise.all([loadServices(), loadMailSources()]);
+  await Promise.all([loadServices()]);
   schedulePoll();
 });
 
@@ -596,22 +588,22 @@ watch(currentPage, () => {
               <PlatformBindingsCell :row="row"/>
             </template>
           </el-table-column>
-          <el-table-column label="邮箱 / 邮箱绑定" min-width="200" show-overflow-tooltip>
-            <template #default="{row}">
-              <MailBindingCell :row="row"/>
-            </template>
-          </el-table-column>
+<!--          <el-table-column label="邮箱绑定" min-width="170">-->
+<!--            <template #default="{row}">-->
+<!--              <MailBindingCell :row="row"/>-->
+<!--            </template>-->
+<!--          </el-table-column>-->
           <el-table-column label="套餐 / 剩余" min-width="280">
             <template #default="{row}">
               <UsageCell :row="row"/>
             </template>
           </el-table-column>
-          <el-table-column label="凭据步骤" min-width="170" show-overflow-tooltip>
+          <el-table-column label="凭据时间" min-width="190">
             <template #default="{row}">
               <StepCell :row="row"/>
             </template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="220">
+          <el-table-column label="操作" fixed="right" width="200">
             <template #default="{row}">
               <RowActions :row="row" :loading="rowActionLoading.has(row.id)"
                           @check="singleCheck"
@@ -645,14 +637,7 @@ watch(currentPage, () => {
         <el-form-item v-if="activeAccount?.has_password">
           <el-checkbox v-model="clearPassword" @change="passwordValue = ''">清空已保存密码</el-checkbox>
         </el-form-item>
-        <el-form-item label="邮箱来源">
-          <el-select v-model="accountSourceId" clearable filterable class="w-full" placeholder="未关联邮箱来源">
-            <el-option v-for="source in mailSources" :key="source.id"
-                       :label="`${source.name} / ${source.mail_type_name || source.provider}`" :value="source.id"/>
-          </el-select>
-        </el-form-item>
       </el-form>
-      <div class="text-xs text-[var(--app-muted)]">修改邮箱来源会清空账号绑定的具体邮箱池记录，只保留来源关系。</div>
       <template #footer>
         <el-button @click="profileDialog = false">取消</el-button>
         <el-button type="primary" :loading="profileSubmitting" @click="saveProfile">保存</el-button>
@@ -716,6 +701,8 @@ watch(currentPage, () => {
         <el-button :icon="Setting" type="primary" :loading="bindingSubmitting" @click="confirmBindings">保存绑定</el-button>
       </template>
     </el-dialog>
+
+    <BulkProgressDialog v-model="bulkProgressVisible" :job="bulkJob" @finished="onBulkFinished"/>
 
     <ReauthDialog v-model="reauthDialogVisible" :account="reauthAccount" :mode="reauthMode" @finished="onReauthFinished"/>
 

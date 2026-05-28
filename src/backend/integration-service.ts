@@ -581,6 +581,32 @@ export async function deleteAccountFromSub2APIService(
   }
 }
 
+export async function findSub2APIAccountByEmail(
+  config: Sub2APIConfig,
+  email: string,
+): Promise<string | null> {
+  const normalizedTarget = email.toLowerCase().trim();
+  if (!normalizedTarget) return null;
+  const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/api/v1/admin/accounts/data`, {
+    method: "GET",
+    headers: {Accept: "application/json", "x-api-key": config.adminApiKey},
+  });
+  if (!response.ok) return null;
+  try {
+    const payload = await response.json() as {data?: {data?: {accounts?: Array<{id?: string | number; email?: string; name?: string}>}}};
+    const accounts = payload?.data?.data?.accounts ?? [];
+    for (const item of accounts) {
+      const itemEmail = String(item.email ?? item.name ?? "").toLowerCase().trim();
+      if (itemEmail && itemEmail === normalizedTarget && item.id != null) {
+        return String(item.id);
+      }
+    }
+  } catch {
+    // 忽略解析失败
+  }
+  return null;
+}
+
 async function testSub2APIConnection(config: Sub2APIConfig): Promise<{success: boolean; message: string}> {
   const response = await fetch(`${normalizeBaseUrl(config.baseUrl)}/api/v1/admin/accounts/import/codex-session`, {
     method: "POST",

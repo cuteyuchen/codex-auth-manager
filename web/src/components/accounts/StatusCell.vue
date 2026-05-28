@@ -1,17 +1,8 @@
 <script setup lang="ts">
 import type {Account} from "../../api";
+import {ACCOUNT_STATUSES} from "../../../../src/shared/constants";
 
 const props = defineProps<{row: Account}>();
-
-const statusOptions = [
-  {label: "正常", value: "authorized", type: "success"},
-  {label: "额度已用尽", value: "quota_exhausted", type: "warning"},
-  {label: "凭据过期", value: "credential_expired", type: "danger"},
-  {label: "账号异常", value: "account_abnormal", type: "danger"},
-  {label: "需要人工重登", value: "needs_manual_reauth", type: "danger"},
-  {label: "未检查", value: "unchecked", type: "info"},
-  {label: "只保存 accessToken", value: "access_token_only", type: "primary"},
-] as const;
 
 function formatDate(value: string | null | undefined) {
   if (!value) return "-";
@@ -20,7 +11,7 @@ function formatDate(value: string | null | undefined) {
 
 function statusTag(row: Account) {
   const status = row.status_code || row.status;
-  const match = statusOptions.find((item) => item.value === status);
+  const match = ACCOUNT_STATUSES[status];
   return {
     label: row.status_label || match?.label || status || "未知",
     type: (match?.type || "info") as "" | "success" | "warning" | "info" | "danger" | "primary",

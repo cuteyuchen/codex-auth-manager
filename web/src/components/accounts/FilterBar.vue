@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {Search} from "@element-plus/icons-vue";
 import type {IntegrationService} from "../../api";
+import {ACCOUNT_STATUSES, CREDENTIAL_TYPES} from "../../../../src/shared/constants";
 
 const props = defineProps<{
   filters: {
@@ -22,21 +23,8 @@ const emit = defineEmits<{
   (event: "update:bindingFilterServiceIds", value: number[]): void;
 }>();
 
-const statusOptions = [
-  {label: "正常", value: "authorized"},
-  {label: "额度已用尽", value: "quota_exhausted"},
-  {label: "凭据过期", value: "credential_expired"},
-  {label: "账号异常", value: "account_abnormal"},
-  {label: "需要人工重登", value: "needs_manual_reauth"},
-  {label: "未检查", value: "unchecked"},
-  {label: "只保存 accessToken", value: "access_token_only"},
-];
-
-const credentialOptions = [
-  {label: "已授权 Codex auth", value: "codex_auth"},
-  {label: "只保存 accessToken", value: "access_token_only"},
-  {label: "无凭据", value: "none"},
-];
+const statusOptions = Object.entries(ACCOUNT_STATUSES).map(([value, {label}]) => ({label, value}));
+const credentialOptions = CREDENTIAL_TYPES;
 </script>
 
 <template>

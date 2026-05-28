@@ -70,6 +70,7 @@ export interface ISMSActivationBroker {
   markAsSucceed(): Promise<void>;
   markAsFailed(rotate?: boolean): Promise<void>;
   discardCurrentActivationAndCancelLater(delayMs?: number): Promise<void>;
+  discardCurrentActivation(): void;
 }
 
 export interface ActivationBrokerState<Activation extends SmsActivation> {

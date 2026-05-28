@@ -4,6 +4,7 @@ import path from "node:path";
 import {Buffer} from "node:buffer";
 import {fetch as undiciFetch, Agent, ProxyAgent, type Dispatcher, type RequestInit as UndiciRequestInit} from "undici";
 import {appConfig} from "../core/config.js";
+import {REAUTH_ELIGIBLE_STATUS_CODES} from "../shared/constants.js";
 import {AUTH_OAUTH_TOKEN_URLS, DEFAULT_CLIENT_ID, DEFAULT_USER_AGENT} from "../core/constants.js";
 import {normalizeEmailAddress} from "../core/email-normalize.js";
 import type {SavedAuthRecord} from "../core/openai.js";
@@ -18,6 +19,7 @@ import {
   recoverSub2APIAccountStateService,
   setSub2APIAccountSchedulableService,
   deleteAccountFromSub2APIService,
+  findSub2APIAccountByEmail,
 } from "./integration-service.js";
 import {
   ensureAccountPlatformBinding,
@@ -25,7 +27,7 @@ import {
   updateBindingPushResult,
   type BoundPlatformService,
 } from "./account-platform-binding-service.js";
-import {createJob, runJob} from "./job-service.js";
+import {addJobEvent, createJob, runJob} from "./job-service.js";
 
 export interface AuthRecord {
     access_token?: string;
@@ -313,6 +315,9 @@ function deriveStatus(summary: {
   if (summary.credentialType === "none") {
     return {statusCode: "credential_expired", statusLabel: "凭据过期"};
   }
+  if (summary.rawStatus === 0) {
+    return {statusCode: "network_error", statusLabel: "网络请求失败"};
+  }
   if (summary.ok) {
     if (summary.limitReached || summary.remainingPercent === 0) {
       return {statusCode: "quota_exhausted", statusLabel: "额度已用尽"};
@@ -324,7 +329,7 @@ function deriveStatus(summary: {
     return {statusCode: "credential_expired", statusLabel: "凭据过期"};
   }
   if (summary.rawStatus === 403 || note.includes("deactivated") || note.includes("forbidden")) {
-    return {statusCode: "account_abnormal", statusLabel: "账号状态异常"};
+    return {statusCode: "account_deactivated", statusLabel: "账号已被封禁"};
   }
   return {statusCode: "account_abnormal", statusLabel: "账号状态异常"};
 }
@@ -552,6 +557,32 @@ export async function summarizeAuthFile(authFileId: number, contentJson: string,
   } else {
     probe = await sendUsageProbe(record.access_token, record.account_id?.trim() || "");
     message = extractMessage(probe.body);
+  }
+
+  // 凭据过期优先：token 已过期或即将过期时，跳过额度检查，直接返回凭据过期
+  const tokenExpiresAt = record.expired ? new Date(record.expired).getTime() : 0;
+  if (tokenExpiresAt > 0 && tokenExpiresAt < Date.now() + 10 * 60 * 1000) {
+    return {
+      file: `auth-file-${authFileId}`,
+      email,
+      plan: localPlan,
+      status: "credential_expired",
+      ok: false,
+      usedPercent: null,
+      remainingPercent: null,
+      resetAt: null,
+      limitReached: null,
+      expires: record.expired?.trim() || "",
+      note: "凭据已过期",
+      rawStatus: 401,
+      rawBody: "",
+      movedTo401: false,
+      refreshed,
+      statusCode: "credential_expired",
+      statusLabel: "凭据过期",
+      credentialType,
+      windows: [],
+    };
   }
 
   if (probe.status === 401) {
@@ -870,6 +901,7 @@ export interface AccountListItem {
     current_step: string | null;
     step_status: string | null;
     last_step_at: string | null;
+    token_expires_at: string | null;
     status_code: string | null;
     status_label: string | null;
     credential_type: string | null;
@@ -960,7 +992,8 @@ export function listAccounts(filters: string | AccountFilters = ""): AccountList
             af.credential_type AS auth_credential_type,
             af.current_step AS current_step,
             af.step_status AS step_status,
-            af.last_step_at AS last_step_at
+            af.last_step_at AS last_step_at,
+            af.token_expires_at AS token_expires_at
         FROM accounts a
         LEFT JOIN auth_files af ON af.account_id = a.id AND af.active = 1
         LEFT JOIN mail_sources ms ON ms.id = a.source_id
@@ -1129,6 +1162,20 @@ export async function getAccountPassword(account: AccountRow): Promise<string> {
 }
 
 function updateAccountFromSummary(accountId: number, summary: AuthSummary): void {
+  const isNetworkError = summary.statusCode === "network_error";
+  let existingStatus: string | null = null;
+  let existingStatusCode: string | null = null;
+  let existingStatusLabel: string | null = null;
+  let existingLastError: string | null = null;
+  if (isNetworkError) {
+    const existing = getDb().prepare("SELECT status, status_code, status_label, last_error FROM accounts WHERE id = ?").get(accountId) as {status: string; status_code: string | null; status_label: string | null; last_error: string | null} | undefined;
+    if (existing) {
+      existingStatus = existing.status;
+      existingStatusCode = existing.status_code;
+      existingStatusLabel = existing.status_label;
+      existingLastError = existing.last_error;
+    }
+  }
   getDb().prepare(`
         UPDATE accounts
         SET status = @status,
@@ -1146,9 +1193,9 @@ function updateAccountFromSummary(accountId: number, summary: AuthSummary): void
         WHERE id = @id
     `).run({
     id: accountId,
-    status: summary.ok ? "ok" : summary.status,
-    status_code: summary.statusCode,
-    status_label: summary.statusLabel,
+    status: isNetworkError ? existingStatus : (summary.ok ? "ok" : summary.status),
+    status_code: isNetworkError ? existingStatusCode : summary.statusCode,
+    status_label: isNetworkError ? existingStatusLabel : summary.statusLabel,
     credential_type: summary.credentialType,
     plan: summary.plan === "-" ? null : summary.plan,
     remaining_percent: summary.remainingPercent,
@@ -1156,7 +1203,7 @@ function updateAccountFromSummary(accountId: number, summary: AuthSummary): void
     reset_at: summary.resetAt,
     last_check_at: currentTimestamp(),
     refreshed: summary.refreshed ? 1 : 0,
-    last_error: summary.ok ? null : summary.note,
+    last_error: isNetworkError ? existingLastError : (summary.ok ? null : summary.note),
     updated_at: currentTimestamp(),
   });
   const timestamp = currentTimestamp();
@@ -1186,7 +1233,9 @@ function updateAccountFromSummary(accountId: number, summary: AuthSummary): void
       updated_at: timestamp,
     });
   }
-  updateAuthFileStep(accountId, summary.ok ? "检查完成" : summary.statusLabel, summary.ok ? "success" : "failed");
+  if (!isNetworkError) {
+    updateAuthFileStep(accountId, summary.ok ? "检查完成" : summary.statusLabel, summary.ok ? "success" : "failed");
+  }
 }
 
 export interface CheckAccountOptions {
@@ -1202,6 +1251,32 @@ export async function checkAccount(accountId: number, forceRefreshOrOptions: boo
   const forceRefresh = Boolean(options.forceRefresh);
   const triggerAutoReauth = Boolean(options.triggerAutoReauth);
 
+  // 已封禁账号不执行任何操作
+  const accountRow = getDb().prepare("SELECT status_code FROM accounts WHERE id = ?").get(accountId) as {status_code: string | null} | undefined;
+  if (accountRow?.status_code === "account_deactivated") {
+    return {
+      file: "",
+      email: "",
+      plan: "",
+      status: "deactivated",
+      ok: false,
+      usedPercent: null,
+      remainingPercent: null,
+      resetAt: null,
+      limitReached: null,
+      expires: "",
+      note: "账号已被封禁，跳过检查",
+      rawStatus: 0,
+      rawBody: "",
+      movedTo401: false,
+      refreshed: false,
+      statusCode: "account_deactivated",
+      statusLabel: "账号已被封禁",
+      credentialType: "none",
+      windows: [],
+    };
+  }
+
   const authFile = getActiveAuthFile(accountId);
   const contentJson = authFile.content_json ?? getAuthFileContent(authFile.id);
   if (!contentJson) {
@@ -1216,7 +1291,6 @@ export async function checkAccount(accountId: number, forceRefreshOrOptions: boo
   return summary;
 }
 
-const REAUTH_ELIGIBLE_STATUS_CODES = new Set(["credential_expired", "credential_invalid"]);
 const reauthTriggerInFlight = new Set<number>();
 
 function maybeTriggerAutoReauth(accountId: number, summary: AuthSummary): void {
@@ -1252,9 +1326,14 @@ function maybeTriggerAutoReauth(accountId: number, summary: AuthSummary): void {
         const result = await reauthorizeAccount(accountId, job.id, {mode: "auto"});
         try {
           await pushAccountToBoundPlatforms(accountId);
-          return {...result, boundPlatformPush: "success"};
-        } catch (error) {
-          return {...result, boundPlatformPush: "failed", pushError: error instanceof Error ? error.message : String(error)};
+        } catch (pushError) {
+          addJobEvent(job.id, "warn", `推送绑定平台失败: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
+        }
+        try {
+          const summary = await checkAccount(accountId, {forceRefresh: true, triggerAutoReauth: false});
+          return {...result, boundPlatformPush: "success", check: summary};
+        } catch (checkError) {
+          return {...result, boundPlatformPush: "success", checkError: checkError instanceof Error ? checkError.message : String(checkError)};
         }
       }, {exclusiveRegister: true});
     } finally {
@@ -1430,7 +1509,7 @@ function isRemoteMissingDeleteError(kind: string, message: string): boolean {
     return message.includes("404") || normalized.includes("auth file not found");
   }
   if (kind === "sub2api") {
-    return message.includes("404") || normalized.includes("not found");
+    return message.includes("404") || normalized.includes("not found") || normalized.includes("invalid account id");
   }
   return false;
 }
@@ -1465,6 +1544,7 @@ async function deletePlatformRecordsForAccount(
     WHERE af.account_id = @accountId
       AND af.credential_source_service_id IN (${placeholders})
   `).all({...params, accountId}) as Array<{serviceId: number; remoteId: string | null; fileName: string; kind: string; serviceName: string}>;
+  const accountEmail = (getDb().prepare("SELECT email FROM accounts WHERE id = ?").get(accountId) as {email: string} | undefined)?.email ?? "";
   const requested = new Set(serviceIds);
   const handledServices = new Set<number>();
   for (const row of rows) {
@@ -1478,7 +1558,13 @@ async function deletePlatformRecordsForAccount(
       if (row.kind === "cpa") {
         await deleteAuthFileFromCPAService({baseUrl: service.baseUrl, managementKey: service.secret}, row.fileName);
       } else if (row.kind === "sub2api") {
-        const remote = (row.remoteId ?? "").trim();
+        let remote = (row.remoteId ?? "").trim();
+        if (!remote && accountEmail) {
+          const found = await findSub2APIAccountByEmail({baseUrl: service.baseUrl, adminApiKey: service.secret, options: service.options}, accountEmail);
+          if (found) {
+            remote = found;
+          }
+        }
         if (!remote) {
           skipped.push({
             serviceId: row.serviceId,
@@ -1515,10 +1601,34 @@ async function deletePlatformRecordsForAccount(
       continue;
     }
     const service = getDb().prepare("SELECT kind, name FROM integration_services WHERE id = ?").get(id) as {kind: string; name: string} | undefined;
+    const kind = service?.kind ?? "";
+    // Sub2API 服务：尝试通过邮箱查找远端 ID 并删除
+    if (kind === "sub2api" && accountEmail) {
+      try {
+        const resolved = await resolvePushServices("sub2api", [id]);
+        const svc = resolved[0];
+        if (svc) {
+          const found = await findSub2APIAccountByEmail({baseUrl: svc.baseUrl, adminApiKey: svc.secret, options: svc.options}, accountEmail);
+          if (found) {
+            await deleteAccountFromSub2APIService({baseUrl: svc.baseUrl, adminApiKey: svc.secret, options: svc.options}, found);
+            deleted.push({serviceId: id, serviceName: service?.name ?? String(id), kind});
+            continue;
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isRemoteMissingDeleteError(kind, message)) {
+          skipped.push({serviceId: id, serviceName: service?.name ?? String(id), kind, message: "远端记录已不存在，已跳过远端删除"});
+        } else {
+          errors.push({serviceId: id, serviceName: service?.name ?? String(id), kind, message});
+        }
+        continue;
+      }
+    }
     skipped.push({
       serviceId: id,
       serviceName: service?.name ?? String(id),
-      kind: service?.kind ?? "",
+      kind,
       message: "本地未记录该平台上的远端 ID，已跳过远端删除",
     });
   }
@@ -1529,6 +1639,18 @@ export async function deleteAccount(accountId: number, options: DeleteAccountOpt
   const account = getAccount(accountId);
   const serviceIds = [...new Set((options.deleteFromServiceIds ?? []).map(Number).filter((v) => Number.isFinite(v) && v > 0))];
   const {deleted, errors, skipped} = await deletePlatformRecordsForAccount(accountId, serviceIds);
+  // 删除绑定的本地邮箱（无其他账号引用时才删除）
+  const mailboxId = account.mailbox_id;
+  if (mailboxId) {
+    const otherRefs = getDb().prepare("SELECT COUNT(*) AS cnt FROM accounts WHERE mailbox_id = ? AND id != ?").get(mailboxId, accountId) as {cnt: number};
+    if (!otherRefs.cnt) {
+      try {
+        getDb().prepare("DELETE FROM mailboxes WHERE id = ?").run(mailboxId);
+      } catch {
+        // 邮箱可能已被其他流程删除，忽略
+      }
+    }
+  }
   getDb().prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
   return {
     deleted: true,
